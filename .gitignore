@@ -1,0 +1,25 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+
+# Python (future implementation)
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Node (future implementation)
+node_modules/
+
+# Local data / real bank statements — never commit real financial data
+data/
+*.pdf
+!resources/*.pdf
+
+# Misplaced/unrelated content — not part of this project
+03 Projects/

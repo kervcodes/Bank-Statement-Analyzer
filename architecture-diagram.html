@@ -1,0 +1,794 @@
+<meta charset="utf-8">
+<title>Bank Statement Analyzer Architecture</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+
+<style>
+  :root {
+    --paper:      #f5f6f1;
+    --surface:    #fefefe;
+    --surface-2:  #eef0e9;
+    --ink:        #1b1e1a;
+    --ink-soft:   #59605a;
+    --ink-faint:  #878e86;
+    --rule:       #d8dbd0;
+    --rule-soft:  #e6e8df;
+    --accent:     #0c6a5a;
+    --accent-ink: #094b40;
+    --valid:      #1a7f5a;
+    --warn:       #9a6b0b;
+    --fail:       #a63a33;
+    --sensitive-edge: #6f6357;
+    --sensitive-fill: #efe9e0;
+    --gateway-fill:   #e4efe9;
+
+    --maxw: 1120px;
+    --readw: 44rem;
+    --step: clamp(1.5rem, 1rem + 2vw, 2.75rem);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper:      #14160f;
+      --surface:    #1c1f19;
+      --surface-2:  #23261f;
+      --ink:        #e8e9e0;
+      --ink-soft:   #a3a89c;
+      --ink-faint:  #767b6e;
+      --rule:       #34382d;
+      --rule-soft:  #2a2d24;
+      --accent:     #46b39c;
+      --accent-ink: #7fd0bf;
+      --valid:      #5cb98e;
+      --warn:       #d09a3f;
+      --fail:       #d9756c;
+      --sensitive-edge: #8c7f70;
+      --sensitive-fill: #201d17;
+      --gateway-fill:   #17241f;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --paper:      #14160f;
+    --surface:    #1c1f19;
+    --surface-2:  #23261f;
+    --ink:        #e8e9e0;
+    --ink-soft:   #a3a89c;
+    --ink-faint:  #767b6e;
+    --rule:       #34382d;
+    --rule-soft:  #2a2d24;
+    --accent:     #46b39c;
+    --accent-ink: #7fd0bf;
+    --valid:      #5cb98e;
+    --warn:       #d09a3f;
+    --fail:       #d9756c;
+    --sensitive-edge: #8c7f70;
+    --sensitive-fill: #201d17;
+    --gateway-fill:   #17241f;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: clamp(1.5rem, 1rem + 3vw, 4rem) clamp(1.1rem, 0.6rem + 2vw, 2.5rem) 5rem; }
+
+  .prose { max-width: var(--readw); }
+
+  h1, h2, h3 { font-family: "Fraunces", Georgia, serif; font-weight: 500; text-wrap: balance; line-height: 1.15; }
+
+  a { color: var(--accent); text-underline-offset: 2px; }
+
+  code, .mono { font-family: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace; }
+
+  /* ---------- header ---------- */
+  header { border-bottom: 1px solid var(--rule); padding-bottom: 2rem; margin-bottom: 2.75rem; }
+  .eyebrow {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.72rem; letter-spacing: 0.16em; text-transform: uppercase;
+    color: var(--ink-faint); margin: 0 0 1rem;
+  }
+  h1 { font-size: clamp(2rem, 1.4rem + 3.2vw, 3.25rem); margin: 0 0 0.9rem; letter-spacing: -0.01em; }
+  .thesis { max-width: var(--readw); font-size: 1.075rem; color: var(--ink-soft); margin: 0 0 1.6rem; }
+  .thesis strong { color: var(--ink); font-weight: 600; }
+  .meta { display: flex; flex-wrap: wrap; gap: 0.4rem 1.4rem; font-family: "IBM Plex Mono", monospace; font-size: 0.78rem; color: var(--ink-faint); }
+  .meta span::before { content: "▸ "; color: var(--accent); }
+
+  /* ---------- section scaffolding ---------- */
+  section { margin-top: 3.5rem; }
+  .sec-head { margin: 0 0 1.4rem; }
+  .sec-head h2 { font-size: 1.6rem; margin: 0 0 0.35rem; }
+  .sec-head p { margin: 0; color: var(--ink-soft); max-width: var(--readw); font-size: 0.96rem; }
+  .sec-num {
+    font-family: "IBM Plex Mono", monospace; font-size: 0.72rem; letter-spacing: 0.14em;
+    color: var(--accent); text-transform: uppercase; display: block; margin-bottom: 0.5rem;
+  }
+
+  /* ---------- pipeline ---------- */
+  .pipeline { display: flex; flex-direction: column; gap: 0; position: relative; }
+
+  .zone {
+    position: relative;
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    background: var(--surface);
+    padding: 1.05rem 1.15rem 1.15rem;
+  }
+  .zone + .zone { margin-top: var(--step); }
+  .zone + .zone::before {
+    content: "";
+    position: absolute; top: calc(-1 * var(--step) - 1px); left: 2rem;
+    width: 2px; height: var(--step);
+    background: var(--rule);
+  }
+  .zone + .zone::after {
+    content: "";
+    position: absolute; top: -7px; left: calc(2rem - 4px);
+    border: 5px solid transparent; border-top-color: var(--ink-faint);
+  }
+
+  .zone-label { display: flex; align-items: baseline; gap: 0.7rem; margin-bottom: 0.85rem; }
+  .zone-n {
+    font-family: "Fraunces", serif; font-size: 1.5rem; font-weight: 600;
+    color: var(--accent); line-height: 1; min-width: 1.4ch;
+  }
+  .zone-name {
+    font-family: "IBM Plex Mono", monospace; font-size: 0.8rem; font-weight: 500;
+    letter-spacing: 0.11em; text-transform: uppercase; color: var(--ink);
+  }
+  .zone-note { margin: 0.9rem 0 0; font-size: 0.85rem; color: var(--ink-soft); }
+  .zone-note b { color: var(--ink); font-weight: 600; }
+
+  .flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0.4rem 0; }
+  .node {
+    display: inline-flex; align-items: center;
+    padding: 0.32rem 0.66rem;
+    background: var(--surface-2);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    font-size: 0.83rem;
+    color: var(--ink);
+  }
+  .node.decision {
+    background: transparent;
+    border-style: dashed;
+    border-color: var(--accent);
+    color: var(--accent-ink);
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.76rem;
+  }
+  .node.term { border-color: var(--fail); color: var(--fail); background: transparent; }
+  .node.store { border-color: var(--sensitive-edge); background: transparent; font-family: "IBM Plex Mono", monospace; font-size: 0.78rem; }
+  .arrow { display: inline-flex; align-items: center; padding: 0 0.34rem; color: var(--ink-faint); font-size: 0.9rem; }
+  .arrow::before { content: "→"; }
+  .branch { display: inline-flex; align-items: center; padding: 0 0.34rem; color: var(--ink-faint); font-size: 0.78rem; font-family: "IBM Plex Mono", monospace; }
+
+  /* ---------- sensitive boundary ---------- */
+  .sensitive {
+    position: relative;
+    margin-top: var(--step);
+    padding: 2.4rem 0.9rem 1rem;
+    border: 1.5px dashed var(--sensitive-edge);
+    border-radius: 4px;
+    background: var(--sensitive-fill);
+  }
+  .sensitive > .zone:first-of-type { margin-top: 0; }
+  .sensitive::before {
+    content: "Sensitive financial data · controlled processing environment";
+    position: absolute; top: 0.7rem; left: 0.9rem; right: 0.9rem;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.7rem; letter-spacing: 0.1em; text-transform: uppercase;
+    color: var(--sensitive-edge);
+  }
+  .sensitive .zone { background: var(--surface); }
+  .boundary-foot {
+    margin: 0.9rem 0 0; font-size: 0.8rem; color: var(--ink-soft);
+    font-style: italic;
+  }
+
+  .gateway-inline {
+    border-color: var(--accent) !important;
+    background: var(--gateway-fill) !important;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.78rem;
+  }
+
+  /* ---------- figures ---------- */
+  figure { margin: 0; }
+  .figs { display: grid; gap: 1.5rem; grid-template-columns: 1fr; }
+  @media (min-width: 900px) { .figs { grid-template-columns: 1fr 1fr; } }
+  .fig-card { border: 1px solid var(--rule); border-radius: 3px; background: var(--surface); padding: 1.15rem 1.25rem 1rem; }
+  .fig-card svg { width: 100%; height: auto; display: block; color: var(--ink); }
+  figcaption { margin-top: 0.7rem; font-size: 0.85rem; color: var(--ink-soft); }
+  figcaption b { color: var(--ink); font-weight: 600; }
+
+  /* ---------- cross-cutting cards ---------- */
+  .xcut { display: grid; gap: 0.9rem; grid-template-columns: 1fr; }
+  @media (min-width: 640px) { .xcut { grid-template-columns: 1fr 1fr; } }
+  @media (min-width: 980px) { .xcut { grid-template-columns: repeat(3, 1fr); } }
+  .xcard { border: 1px solid var(--rule); border-left: 2px solid var(--accent); border-radius: 2px; background: var(--surface); padding: 0.9rem 1rem; }
+  .xcard h3 { font-family: "IBM Plex Mono", monospace; font-size: 0.8rem; font-weight: 500; letter-spacing: 0.06em; margin: 0 0 0.35rem; color: var(--ink); }
+  .xcard p { margin: 0; font-size: 0.85rem; color: var(--ink-soft); }
+
+  /* ---------- enums ---------- */
+  .enums { display: grid; gap: 1.3rem; grid-template-columns: 1fr; }
+  @media (min-width: 760px) { .enums { grid-template-columns: 1fr 1fr; } }
+  .enum h3 { font-size: 1.02rem; margin: 0 0 0.5rem; }
+  .chips { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+  .chip {
+    font-family: "IBM Plex Mono", monospace; font-size: 0.75rem;
+    padding: 0.2rem 0.5rem; border: 1px solid var(--rule); border-radius: 2px;
+    background: var(--surface); color: var(--ink-soft);
+  }
+  .chip.s-valid { border-color: var(--valid); color: var(--valid); }
+  .chip.s-warn  { border-color: var(--warn);  color: var(--warn); }
+  .chip.s-fail  { border-color: var(--fail);  color: var(--fail); }
+  .enum .seq { color: var(--ink-faint); }
+
+  /* ---------- invariants ---------- */
+  .inv-group { margin-top: 1.6rem; }
+  .inv-group > h3 {
+    font-family: "IBM Plex Mono", monospace; font-size: 0.76rem; font-weight: 500;
+    letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent);
+    margin: 0 0 0.7rem; padding-bottom: 0.4rem; border-bottom: 1px solid var(--rule-soft);
+  }
+  #invariants { counter-reset: inv; }
+  ol.inv { margin: 0; padding: 0; list-style: none; display: grid; gap: 0.55rem; }
+  ol.inv li {
+    counter-increment: inv;
+    display: grid; grid-template-columns: 2.2rem 1fr; gap: 0.4rem;
+    font-size: 0.9rem; color: var(--ink);
+  }
+  ol.inv li::before {
+    content: counter(inv, decimal-leading-zero);
+    font-family: "IBM Plex Mono", monospace; font-size: 0.76rem;
+    color: var(--ink-faint); padding-top: 0.15rem;
+  }
+
+  /* ---------- table ---------- */
+  .tbl-scroll { overflow-x: auto; border: 1px solid var(--rule); border-radius: 3px; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.87rem; min-width: 34rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border-bottom: 1px solid var(--rule-soft); vertical-align: top; }
+  th { font-family: "IBM Plex Mono", monospace; font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-faint); background: var(--surface-2); }
+  tbody tr:last-child td { border-bottom: none; }
+  td:first-child { font-family: "IBM Plex Mono", monospace; color: var(--accent); white-space: nowrap; }
+
+  /* ---------- vNext ---------- */
+  .vnext {
+    border: 1px solid var(--rule);
+    border-top: 3px solid var(--warn);
+    border-radius: 3px;
+    background: var(--surface);
+    padding: 1.4rem 1.4rem 1.5rem;
+  }
+  .vnext .tag {
+    display: inline-block;
+    font-family: "IBM Plex Mono", monospace; font-size: 0.68rem;
+    letter-spacing: 0.12em; text-transform: uppercase; color: var(--warn);
+    border: 1px solid var(--warn); border-radius: 2px;
+    padding: 0.1rem 0.45rem; margin-bottom: 0.9rem;
+  }
+  .vnext h3 { font-size: 1.15rem; margin: 0 0 0.5rem; }
+  .vnext > p { margin: 0 0 1rem; color: var(--ink-soft); font-size: 0.92rem; max-width: var(--readw); }
+  .vnext .opts { display: grid; gap: 0.7rem; grid-template-columns: 1fr; margin: 1rem 0; }
+  @media (min-width: 820px) { .vnext .opts { grid-template-columns: repeat(3, 1fr); } }
+  .opt { border: 1px solid var(--rule); border-radius: 2px; padding: 0.75rem 0.85rem; font-size: 0.83rem; }
+  .opt.pick { border-color: var(--accent); background: var(--gateway-fill); }
+  .opt h4 { font-family: "IBM Plex Mono", monospace; font-size: 0.76rem; font-weight: 500; margin: 0 0 0.35rem; color: var(--ink); }
+  .opt p { margin: 0; color: var(--ink-soft); }
+  .vnext .rules { margin: 1rem 0 0; padding-left: 1.1rem; font-size: 0.87rem; }
+  .vnext .rules li { margin: 0.3rem 0; }
+
+  footer {
+    margin-top: 4.5rem; padding-top: 1.6rem; border-top: 1px solid var(--rule);
+    font-size: 0.82rem; color: var(--ink-soft);
+  }
+  footer p { margin: 0.3rem 0; }
+  footer .mono { color: var(--ink-faint); }
+
+  @media (prefers-reduced-motion: no-preference) {
+    a { transition: color 0.15s ease; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header>
+    <p class="eyebrow">System Design · Kervintz AI Brain</p>
+    <h1>Bank Statement Analyzer Architecture</h1>
+    <p class="thesis">
+      A local-first system that turns a pile of PDF bank statements from many institutions into
+      one <strong>reconciled, categorized, traceable</strong> financial overview. Deterministic
+      code owns every number; a validation gate stands between parsing and analytics; and every
+      path to the language model runs through a privacy gateway. The model explains figures — it
+      never produces them.
+    </p>
+    <div class="meta">
+      <span>Design session 2026-08-30 · 79 pages</span>
+      <span>Spec written 2026-09-03</span>
+      <span>Status: design artifact — nothing built</span>
+      <span>Slice execution queued behind P2</span>
+    </div>
+  </header>
+
+  <section id="pipeline">
+    <div class="sec-head">
+      <span class="sec-num">01 — The pipeline</span>
+      <h2>Seven zones, data flowing down</h2>
+      <p>
+        Each zone is one responsibility. Dashed pills are the decision points the design turns
+        on. Red outlines are terminal states — a statement can leave the pipeline here without
+        taking the rest of the batch with it.
+      </p>
+    </div>
+
+    <div class="pipeline">
+
+      <div class="zone">
+        <div class="zone-label"><span class="zone-n">1</span><span class="zone-name">User / Client</span></div>
+        <div class="flow">
+          <span class="node">Select one or more PDF statements</span>
+        </div>
+      </div>
+
+      <div class="zone">
+        <div class="zone-label"><span class="zone-n">2</span><span class="zone-name">Intake</span></div>
+        <div class="flow">
+          <span class="node">Create analysis batch</span><span class="arrow"></span>
+          <span class="node">File intake / upload</span><span class="arrow"></span>
+          <span class="node decision">upload ok?</span><span class="branch">no →</span>
+          <span class="node term">record upload failure · retry</span>
+        </div>
+        <div class="flow" style="margin-top:.5rem">
+          <span class="node decision">valid supported PDF?</span><span class="branch">no →</span>
+          <span class="node term">reject + reason</span><span class="branch">&nbsp;&nbsp;yes →</span>
+          <span class="node store">Temporary File Storage</span><span class="arrow"></span>
+          <span class="node">create statement job</span><span class="arrow"></span>
+          <span class="node">enqueue job reference — not the PDF</span>
+        </div>
+        <p class="zone-note">
+          Upload failure and validation failure are <b>separate concerns</b>. Invalid files
+          never enter the queue. The queue carries a <b>reference</b> to the stored file, not
+          the PDF bytes.
+        </p>
+      </div>
+
+      <div class="sensitive">
+        <p class="boundary-foot" style="margin:0 0 1.4rem">
+          Temporary File Storage also sits inside this boundary — sensitive data does not leave
+          the controlled processing environment.
+        </p>
+
+        <div class="zone">
+          <div class="zone-label"><span class="zone-n">3</span><span class="zone-name">Background Processing</span></div>
+          <div class="flow">
+            <span class="node store">Job Queue</span><span class="arrow"></span>
+            <span class="node">worker pool</span><span class="arrow"></span>
+            <span class="node">run statement pipeline</span><span class="arrow"></span>
+            <span class="node decision">failure? retryable? attempts &lt; 3?</span><span class="branch">yes → requeue</span>
+            <span class="branch">&nbsp;·&nbsp; no →</span><span class="node term">mark FAILED</span>
+          </div>
+          <p class="zone-note">
+            <b>Batch Coordinator</b> tracks every job's state and gates aggregation: it begins
+            only once every processable job is terminal. Retries recover transient failures —
+            they do not hide bad input. Max 3 attempts.
+          </p>
+        </div>
+
+        <div class="zone">
+          <div class="zone-label"><span class="zone-n">4</span><span class="zone-name">Extraction + Normalization</span></div>
+          <div class="flow">
+            <span class="node">inspect PDF</span><span class="arrow"></span>
+            <span class="node decision">usable embedded text?</span><span class="branch">yes →</span>
+            <span class="node">native extraction</span><span class="branch">&nbsp;·&nbsp; no →</span>
+            <span class="node">OCR (fallback)</span><span class="arrow"></span>
+            <span class="node">extracted text</span>
+          </div>
+          <div class="flow" style="margin-top:.5rem">
+            <span class="node">detect bank + account type + layout version</span><span class="arrow"></span>
+            <span class="node decision">supported w/ confidence?</span><span class="branch">no →</span>
+            <span class="node term">UNSUPPORTED / manual review</span>
+          </div>
+          <div class="flow" style="margin-top:.5rem">
+            <span class="node">versioned parser</span><span class="arrow"></span>
+            <span class="node">normalize to canonical schema</span><span class="arrow"></span>
+            <span class="node">resolve account identity</span><span class="arrow"></span>
+            <span class="node">financial validation</span><span class="arrow"></span>
+            <span class="node decision">validation acceptable?</span>
+          </div>
+          <p class="zone-note">
+            Native and OCR paths converge on one contract: <b>extracted text</b>. Nothing
+            downstream cares which produced it. Detection identifies <b>bank + account type +
+            layout version</b> — never guess the closest parser, fail loudly. Parsing success
+            is not trustworthy data; <b>validation is the trust gate</b>.
+          </p>
+        </div>
+
+        <div class="zone">
+          <div class="zone-label"><span class="zone-n">5</span><span class="zone-name">Trusted Data + Aggregation</span></div>
+          <div class="flow">
+            <span class="node store">Application Data Store</span><span class="arrow"></span>
+            <span class="node decision">all batch jobs terminal?</span><span class="arrow"></span>
+            <span class="node">statement-level dedup</span><span class="arrow"></span>
+            <span class="node">transaction-level dedup</span><span class="arrow"></span>
+            <span class="node">Unified Ledger</span>
+          </div>
+          <p class="zone-note">
+            Raw PDFs and normalized data live in <b>separate stores</b>. Deduplication is
+            conservative — collapse only on HIGH confidence; keep and flag anything ambiguous.
+            Deleting a real transaction is worse than showing a possible duplicate. The ledger
+            is where the system stops thinking in PDFs and starts thinking in accounts.
+          </p>
+        </div>
+
+        <div class="zone">
+          <div class="zone-label"><span class="zone-n">6</span><span class="zone-name">Enrichment + Analytics + AI</span></div>
+          <div class="flow">
+            <span class="node">merchant normalization</span><span class="arrow"></span>
+            <span class="node">rule-based categorization</span><span class="arrow"></span>
+            <span class="node decision">confident?</span><span class="branch">no →</span>
+            <span class="node gateway-inline">Privacy Gateway</span><span class="arrow"></span>
+            <span class="node">Local LLM</span><span class="arrow"></span>
+            <span class="node decision">confidence ok?</span><span class="branch">no →</span>
+            <span class="node">Uncategorized</span>
+          </div>
+          <div class="flow" style="margin-top:.5rem">
+            <span class="node">Deterministic Analytics Engine — owns the numbers</span><span class="arrow"></span>
+            <span class="node">structured insights (JSON facts)</span><span class="arrow"></span>
+            <span class="node gateway-inline">Privacy Gateway</span><span class="arrow"></span>
+            <span class="node">Local LLM</span><span class="arrow"></span>
+            <span class="node">plain-English explanation</span>
+          </div>
+          <p class="zone-note">
+            Merchant normalization happens <b>before</b> categorization. Deterministic rules are
+            tried before any model. Categorization degrades to <b>Uncategorized</b>, never a
+            confident guess. User corrections override automation and feed future runs.
+          </p>
+        </div>
+      </div>
+
+      <div class="zone">
+        <div class="zone-label"><span class="zone-n">7</span><span class="zone-name">Outputs + Coverage + Cleanup</span></div>
+        <div class="flow">
+          <span class="node">report builder</span><span class="arrow"></span>
+          <span class="node">coverage &amp; data-quality summary — shown first</span><span class="arrow"></span>
+          <span class="node">dashboard · report · CSV / JSON export</span>
+        </div>
+        <div class="flow" style="margin-top:.5rem">
+          <span class="node decision">raw PDF still needed?</span><span class="branch">no →</span>
+          <span class="node">delete raw PDF</span><span class="branch">&nbsp;&nbsp;always →</span>
+          <span class="node">retain provenance metadata</span>
+        </div>
+        <p class="zone-note">
+          Incomplete analysis is <b>never</b> presented as complete — excluded statements are
+          listed, not buried. The AI explanation never replaces the metric; the dashboard shows
+          both. Every reported figure stays traceable to account, statement, page, and parser
+          version even after the raw PDF is gone.
+        </p>
+      </div>
+
+    </div>
+  </section>
+
+  <section id="claims">
+    <div class="sec-head">
+      <span class="sec-num">02 — Two boundaries the design turns on</span>
+      <h2>The trust gate and the privacy gateway</h2>
+      <p>Everything else follows from these two. They are what make the project more than a PDF parser.</p>
+    </div>
+
+    <div class="figs">
+
+      <figure class="fig-card">
+        <svg viewBox="0 0 460 260" role="img" aria-label="Parsed statement data passes through structural, transaction, and reconciliation checks; only data that reconciles within tolerance reaches the analytics engine, and anything that fails is flagged and excluded.">
+          <defs>
+            <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="currentColor"/>
+            </marker>
+          </defs>
+          <g font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">
+            <rect x="1" y="104" width="96" height="40" rx="2" fill="none" stroke="currentColor"/>
+            <text x="49" y="120" text-anchor="middle">parser</text>
+            <text x="49" y="134" text-anchor="middle">output</text>
+
+            <line x1="97" y1="124" x2="129" y2="124" stroke="currentColor" marker-end="url(#ah)"/>
+
+            <rect x="130" y="72" width="132" height="104" rx="2" fill="none" stroke="currentColor" stroke-dasharray="4 3"/>
+            <text x="196" y="90" text-anchor="middle" font-size="10">validation</text>
+            <text x="196" y="112" text-anchor="middle" font-size="10.5">structural</text>
+            <text x="196" y="130" text-anchor="middle" font-size="10.5">transaction</text>
+            <text x="196" y="148" text-anchor="middle" font-size="10.5" fill="var(--accent)">reconciliation</text>
+            <text x="196" y="166" text-anchor="middle" font-size="9" fill="var(--ink-soft, currentColor)">open+cr−db ≈ close</text>
+
+            <line x1="262" y1="124" x2="294" y2="124" stroke="currentColor" marker-end="url(#ah)"/>
+
+            <path d="M334 92 L380 124 L334 156 L288 124 Z" fill="none" stroke="var(--accent)"/>
+            <text x="334" y="121" text-anchor="middle" font-size="8.5">within</text>
+            <text x="334" y="132" text-anchor="middle" font-size="8.5">tolerance?</text>
+
+            <line x1="334" y1="96" x2="334" y2="46" stroke="currentColor"/>
+            <line x1="334" y1="46" x2="378" y2="46" stroke="currentColor" marker-end="url(#ah)"/>
+            <text x="345" y="40" font-size="9" fill="var(--valid)">VALID</text>
+            <rect x="379" y="30" width="80" height="34" rx="2" fill="none" stroke="var(--valid)"/>
+            <text x="419" y="50" text-anchor="middle" font-size="10" fill="var(--valid)">analytics</text>
+
+            <line x1="334" y1="156" x2="334" y2="212" stroke="currentColor"/>
+            <line x1="334" y1="212" x2="378" y2="212" stroke="currentColor" marker-end="url(#ah)"/>
+            <text x="343" y="206" font-size="9" fill="var(--fail)">FAILED</text>
+            <rect x="379" y="196" width="80" height="34" rx="2" fill="none" stroke="var(--fail)"/>
+            <text x="419" y="210" text-anchor="middle" font-size="9.5" fill="var(--fail)">flagged +</text>
+            <text x="419" y="222" text-anchor="middle" font-size="9.5" fill="var(--fail)">excluded</text>
+          </g>
+        </svg>
+        <figcaption>
+          <b>The trust gate.</b> No statement reaches portfolio-level analytics until its
+          normalized data passes validation. Reconciliation catches the confident misread —
+          <span class="mono">$800.00</span> parsed as <span class="mono">$8,000</span> — that
+          extraction confidence alone would wave through.
+        </figcaption>
+      </figure>
+
+      <figure class="fig-card">
+        <svg viewBox="0 0 460 260" role="img" aria-label="Both the unknown-transaction path and the analytics-results path enter a single privacy gateway that sanitizes and builds a task-specific payload before the local LLM; there is no direct path from analytics to the model.">
+          <defs>
+            <marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="currentColor"/>
+            </marker>
+          </defs>
+          <g font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor">
+            <rect x="1" y="34" width="118" height="36" rx="2" fill="none" stroke="currentColor"/>
+            <text x="60" y="49" text-anchor="middle">unknown</text>
+            <text x="60" y="62" text-anchor="middle">transaction</text>
+
+            <rect x="1" y="150" width="118" height="36" rx="2" fill="none" stroke="currentColor"/>
+            <text x="60" y="165" text-anchor="middle">analytics</text>
+            <text x="60" y="178" text-anchor="middle">results</text>
+
+            <path d="M119 52 C 150 52, 150 110, 178 110" fill="none" stroke="currentColor" marker-end="url(#ah2)"/>
+            <path d="M119 168 C 150 168, 150 122, 178 122" fill="none" stroke="currentColor" marker-end="url(#ah2)"/>
+
+            <rect x="179" y="86" width="126" height="60" rx="2" fill="none" stroke="var(--accent)" stroke-width="1.5"/>
+            <text x="242" y="104" text-anchor="middle" font-size="10" fill="var(--accent)">Privacy Gateway</text>
+            <text x="242" y="120" text-anchor="middle" font-size="9">sanitize +</text>
+            <text x="242" y="132" text-anchor="middle" font-size="9">task payload</text>
+
+            <line x1="305" y1="116" x2="337" y2="116" stroke="currentColor" marker-end="url(#ah2)"/>
+            <rect x="338" y="96" width="104" height="40" rx="2" fill="none" stroke="currentColor"/>
+            <text x="390" y="113" text-anchor="middle">Local LLM</text>
+            <text x="390" y="126" text-anchor="middle" font-size="8.5" fill="var(--ink-soft, currentColor)">explains only</text>
+
+            <path d="M119 160 C 210 250, 330 250, 388 138" fill="none" stroke="var(--fail)" stroke-dasharray="4 4"/>
+            <line x1="238" y1="234" x2="258" y2="214" stroke="var(--fail)" stroke-width="1.5"/>
+            <line x1="258" y1="234" x2="238" y2="214" stroke="var(--fail)" stroke-width="1.5"/>
+            <text x="248" y="250" text-anchor="middle" font-size="9" fill="var(--fail)">no direct path</text>
+          </g>
+        </svg>
+        <figcaption>
+          <b>The privacy gateway.</b> One component, two entry points. Every path into the model
+          is sanitized to the minimum the task needs. <b>Model location is not the privacy
+          control — sanitization is</b>; the boundary holds whether the LLM is local or hosted.
+        </figcaption>
+      </figure>
+
+    </div>
+  </section>
+
+  <section id="xcut">
+    <div class="sec-head">
+      <span class="sec-num">03 — Cross-cutting components</span>
+      <h2>Parts that span the zones</h2>
+      <p>These are not a pipeline stage. They hold state or enforce a rule across the whole flow.</p>
+    </div>
+    <div class="xcut">
+      <div class="xcard"><h3>Temporary File Storage</h3><p>Raw PDFs, only while processing needs them. Sensitive, short-lived, deleted after — unless the user opts to keep them.</p></div>
+      <div class="xcard"><h3>Application Data Store</h3><p>Normalized, non-raw system state: batches, accounts, statements, transactions, validation results, analytics output. Persistent.</p></div>
+      <div class="xcard"><h3>Batch Coordinator</h3><p>Orchestration only, never parses. Tracks per-job state; decides when all processable jobs are terminal; gates aggregation.</p></div>
+      <div class="xcard"><h3>Privacy Gateway</h3><p>Mandatory gate in front of every model call — PII sanitizer plus task-specific payload builder. One component, multiple entry points.</p></div>
+      <div class="xcard"><h3>Retry Handling</h3><p>Separates retryable (transient) from non-retryable (deterministic) failures. Requeue reuses the same temp-file reference. Max 3 attempts.</p></div>
+      <div class="xcard"><h3>Coverage / Warning State</h3><p>Batch-level rollup of what was processed, excluded, and flagged. Surfaced before any numbers.</p></div>
+    </div>
+  </section>
+
+  <section id="enums">
+    <div class="sec-head">
+      <span class="sec-num">04 — State</span>
+      <h2>The state a statement and a batch move through</h2>
+    </div>
+    <div class="enums">
+      <div class="enum">
+        <h3>Statement job</h3>
+        <div class="chips">
+          <span class="chip">UPLOADED</span><span class="chip">VALIDATED</span><span class="chip">QUEUED</span>
+          <span class="chip">PROCESSING</span><span class="chip">RETRYING</span><span class="chip">EXTRACTED</span>
+          <span class="chip">NORMALIZED</span><span class="chip">VALIDATED</span><span class="chip">COMPLETED</span>
+          <span class="chip s-fail">FAILED</span><span class="chip s-fail">UNSUPPORTED</span>
+        </div>
+      </div>
+      <div class="enum">
+        <h3>Batch</h3>
+        <div class="chips">
+          <span class="chip">PROCESSING</span><span class="chip s-valid">COMPLETED</span>
+          <span class="chip s-warn">COMPLETED_WITH_WARNINGS</span><span class="chip s-fail">FAILED</span>
+        </div>
+      </div>
+      <div class="enum">
+        <h3>Validation status</h3>
+        <div class="chips">
+          <span class="chip s-valid">VALID</span><span class="chip s-warn">WARNING</span><span class="chip s-fail">FAILED</span>
+        </div>
+        <p class="enum seq" style="font-size:.82rem;margin:.5rem 0 0">
+          Slice tolerance — VALID within ±$0.01 · WARNING to ±$1.00 · FAILED beyond.
+        </p>
+      </div>
+      <div class="enum">
+        <h3>Duplicate confidence</h3>
+        <div class="chips">
+          <span class="chip s-valid">HIGH · collapse</span><span class="chip s-warn">POSSIBLE · keep + flag</span><span class="chip">NOT DUPLICATE · keep</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="invariants">
+    <div class="sec-head">
+      <span class="sec-num">05 — Invariants</span>
+      <h2>The thirty rules the design commits to</h2>
+      <p>Collected from the design session. Each one is a line the implementation is not allowed to cross.</p>
+    </div>
+
+    <div class="inv-group">
+      <h3>Intake &amp; queue</h3>
+      <ol class="inv">
+        <li>Upload failure and validation failure are separate concerns.</li>
+        <li>One failed statement must not invalidate unrelated statements in the same batch.</li>
+        <li>Invalid files never enter the processing queue.</li>
+        <li>Each statement is processed independently; the batch coordinates progress and aggregation.</li>
+        <li>The queue carries a reference to the temporary file, not the PDF bytes.</li>
+      </ol>
+    </div>
+
+    <div class="inv-group">
+      <h3>Extraction</h3>
+      <ol class="inv" start="6">
+        <li>OCR is a fallback path, not the default extraction method.</li>
+        <li>Retries recover transient failures — they do not hide bad input (max 3 attempts).</li>
+        <li>Detect bank + account type + statement format/version from content before parsing; version parsers independently of the bank name.</li>
+        <li>Never silently guess the closest bank parser — fail loudly.</li>
+      </ol>
+    </div>
+
+    <div class="inv-group">
+      <h3>Canonical boundary &amp; trust</h3>
+      <ol class="inv" start="10">
+        <li>Analytics operates on canonical data, never on bank-specific parser output.</li>
+        <li>Statements are grouped by account identity, not merely by bank; never silently merge ambiguous accounts.</li>
+        <li>Parsing success is not trustworthy financial data. Validation is the trust gate.</li>
+        <li>No statement enters portfolio-level analytics until its normalized data passes minimum validation.</li>
+        <li>Extraction confidence (fields read correctly?) is separate from validation status (numbers make sense?).</li>
+        <li>Every normalized transaction remains traceable to its source statement, page, and parser version.</li>
+      </ol>
+    </div>
+
+    <div class="inv-group">
+      <h3>Aggregation</h3>
+      <ol class="inv" start="16">
+        <li>Partial analysis is allowed, but excluded statements must be visible and reflected in report confidence.</li>
+        <li>Aggregation begins only after every processable statement job has reached a terminal state.</li>
+        <li>Deduplication is conservative: auto-remove only on HIGH confidence; ambiguous matches kept and flagged.</li>
+      </ol>
+    </div>
+
+    <div class="inv-group">
+      <h3>Analytics &amp; AI</h3>
+      <ol class="inv" start="19">
+        <li>Financial calculations come from deterministic logic; the LLM may explain results but does not own the numbers.</li>
+        <li>Merchant normalization happens before categorization.</li>
+        <li>Categorization degrades to Uncategorized, not to a confident guess.</li>
+        <li>User corrections override automated categorization and feed future categorization.</li>
+      </ol>
+    </div>
+
+    <div class="inv-group">
+      <h3>Privacy</h3>
+      <ol class="inv" start="23">
+        <li>Model location is not the privacy control; sanitization is the privacy control.</li>
+        <li>Every path into a model passes through the Privacy Gateway. There is no direct path to the model.</li>
+        <li>The LLM receives the minimum data required for the task.</li>
+        <li>Raw bank statements are temporary processing artifacts, not permanent application data.</li>
+      </ol>
+    </div>
+
+    <div class="inv-group">
+      <h3>Output</h3>
+      <ol class="inv" start="27">
+        <li>The LLM explanation never replaces the underlying numbers — the dashboard shows both.</li>
+        <li>Coverage and exclusions are always visible; incomplete datasets are never presented as complete.</li>
+        <li>Users can export the normalized data — the system is not a closed black box.</li>
+        <li>Every reported financial fact remains traceable even after raw documents are deleted.</li>
+      </ol>
+    </div>
+  </section>
+
+  <section id="gaps">
+    <div class="sec-head">
+      <span class="sec-num">06 — Open design gaps</span>
+      <h2>What the design session did not settle</h2>
+      <p>Recorded honestly. The thin vertical slice is scoped specifically to sidestep most of them.</p>
+    </div>
+    <div class="tbl-scroll">
+      <table>
+        <thead><tr><th>Gap</th><th>Why it matters</th><th>Disposition</th></tr></thead>
+        <tbody>
+          <tr><td>Test / demo data</td><td>Real statements can't be committed — no fixtures, no regression tests.</td><td>Dev on own statements; build a synthetic generator for demo and fixtures.</td></tr>
+          <tr><td>extraction_confidence</td><td>The native text path has no confidence source; only OCR emits one.</td><td>Make the field nullable; document that only OCR populates it.</td></tr>
+          <tr><td>Reconciliation tolerance</td><td>One constant sets the false-positive rate on the strongest check.</td><td>Slice: ±$0.01 VALID / ±$1.00 WARNING / beyond FAILED.</td></tr>
+          <tr><td>Queue machinery</td><td>Queue + workers + coordinator is over-built for a zero-user v1.</td><td>Keep the design; implement the simplest thing that honors the boundaries.</td></tr>
+          <tr><td>Per-bank parsers</td><td>~10–15 versioned parsers across 5 banks does not scale for one person.</td><td>The slice builds exactly one parser, one bank.</td></tr>
+          <tr><td>Local LLM vs live demo</td><td>A local-first privacy story means no hosted URL for a recruiter.</td><td>Slice has no LLM; full-MVP demo runs on synthetic data.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="vnext">
+    <div class="sec-head">
+      <span class="sec-num">07 — Bonus feature</span>
+      <h2>Household / partner overview</h2>
+      <p>Not part of the MVP. Captured here because it is the feature that would change the project's nature.</p>
+    </div>
+
+    <div class="vnext">
+      <span class="tag">vNext · gated</span>
+      <h3>Invite a partner for a joint household view</h3>
+      <p>
+        Combined cash flow, shared-vs-individual spending, household recurring charges, a
+        lender-recognizable household income picture. The catch: it puts one person's
+        financial data in front of another — a direct tension with the local-first thesis —
+        so it does not start until the single-user core ships and is used.
+      </p>
+
+      <div class="opts">
+        <div class="opt pick">
+          <h4>A · Bundle exchange ✓</h4>
+          <p>Each partner keeps their own instance and shares a sanitized, revocable bundle. No server, no shared account, no auth. A small extension of the CSV export.</p>
+        </div>
+        <div class="opt">
+          <h4>B · One host</h4>
+          <p>Partner uploads to the host's instance. One live joint view, but asymmetric — the host holds and controls everything. Needs a real invite mechanism.</p>
+        </div>
+        <div class="opt">
+          <h4>C · Hosted workspace</h4>
+          <p>Both upload to a shared server. Best UX, natural paid tier — but abandons local-first entirely. A pivot decision, not a bonus feature.</p>
+        </div>
+      </div>
+
+      <ul class="rules">
+        <li>The joint view is read-only and derived — the two ledgers are never merged into one owned dataset.</li>
+        <li>Every account and transaction stays attributed to the party that owns it.</li>
+        <li>Sharing is explicit and revocable; the UI says plainly that what is imported cannot be un-copied.</li>
+        <li>Household cash flow nets out inter-party transfers — money moving between partners is not household income or spending.</li>
+        <li>Coverage is reported per party; the joint view is only as complete as the least-covered side.</li>
+        <li>Sharing is always opt-in, never a precondition to using the tool.</li>
+      </ul>
+    </div>
+  </section>
+
+  <footer>
+    <p>Companion documents in the Kervintz AI Brain vault:</p>
+    <p class="mono">project-spec.md · architecture.md · Design-Review-and-Scope.md · resources/Design Architecture Diagrams.pdf</p>
+    <p style="margin-top:1rem">
+      This is a design artifact. Nothing is built. Slice execution is queued behind P2
+      (BranchBeacon prospect agent) per the scope decision dated 2026-08-30.
+    </p>
+  </footer>
+
+</div>
