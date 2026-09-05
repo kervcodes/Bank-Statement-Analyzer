@@ -38,7 +38,7 @@ Branch: `feature/monorepo-skeleton`
 
 - [x] Root-level scripts or docs for running both halves in dev — added root `README.md` (less duplication than the Vite template's `apps/desktop/README.md`)
 - [x] Confirm `.gitignore` already covers `node_modules/`, `.venv/`, `dist/`, backend build output — added `dist-electron/` to `apps/desktop/.gitignore`, not covered by the Vite template default
-- [ ] Manual verification: `pnpm dev` launches Electron; backend confirmed serving `/health` with `200 {"status":"ok"}` and the correct CORS header for the renderer's origin, and the window opens with no crash dialog — but the on-screen render itself is not yet confirmed (no screenshot tooling available here for native Electron windows), pending the user looking at their own screen
+- [x] Manual verification: `pnpm dev` launches Electron; backend confirmed serving `/health` with `200 {"status":"ok"}` and the correct CORS header for the renderer's origin, and the window opens with no crash dialog. **Confirmed on screen by the user on 2026-09-04** — the Electron window renders the health card with `{"status":"ok"}`. End-to-end skeleton verified.
 
 ## Out of scope for this task (confirmed against techstack.md / build-plan.md)
 
@@ -63,8 +63,8 @@ workflow.
 - Electron window opens with title "desktop" and normal menu, no crash dialog
 
 **Known issues:**
-- The on-screen render of the health check (not just the backend response) has not been visually
-  confirmed from this environment — no screenshot tooling for native Electron windows here.
+- ~~On-screen render not visually confirmed.~~ Resolved 2026-09-04: user confirmed the rendered
+  window showing `{"status":"ok"}`. Screenshot published with the build-log post.
 - `uv run uvicorn --reload` did not reliably kill/replace its old worker process on Windows during
   this session (had to fully kill the process tree once to pick up a code change). Not a skeleton
   defect, but worth knowing if `--reload` seems to silently ignore a change later.
