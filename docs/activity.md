@@ -89,3 +89,100 @@ hit the same issue.
 `data/app.db`; `pytest` — 2 passed, no warnings.
 
 **Next step:** build-plan.md #3 — intake and validation endpoint.
+
+
+---
+
+## 2026-09-05 - Money as integer cents, schema constraints, FK enforcement
+
+**Prompt:** verification of build-plan #2 before moving on. Three defects found by probing the
+schema with deliberately bad input, none of which the passing 2-test suite detected.
+
+### Defects found
+
+1. **Money lost precision.** `Decimal` fields landed in SQLite as `REAL`. Measured:
+   `Decimal("12345678.91")` round-tripped as `Decimal("12345678.9100000001")`, while
+   `Decimal("0.10")` survived intact. The loss is magnitude-dependent, so tests using `15.99`
+   and `2000.00` passed while the representation was already broken. This breaks exact-match
+   dedup (REQ-DEDUP-002) and corrupts reconciliation (REQ-VAL-001) - whose rounding tolerance
+   would have *absorbed* the drift rather than reporting it.
+2. **Foreign keys were not enforced.** SQLite defaults `PRAGMA foreign_keys` to OFF per
+   connection. Measured: a `Transaction` with `statement_id="does-not-exist-anywhere"` was
+   accepted and committed.
+3. **State columns were unconstrained free text.** Measured: `direction="NOT_A_REAL_DIRECTION"`
+   was accepted. `amount` was documented as always-positive (REQ-NORM-003) with nothing
+   enforcing it.
+
+### Decisions
+
+- **Money is stored as integer minor units (cents).** Chosen over a `Decimal`-as-TEXT
+  SQLAlchemy `TypeDecorator`. Both are exact; the deciding factor was failure mode. The TEXT
+  approach fails silently (an unquantized write, a `SUM()` over strings, a lexicographic
+  `ORDER BY`), which is the same class of quiet wrongness as the original bug. Integer cents
+  fails loudly - an off-by-100 shows as $1,599.00 instead of $15.99 and is caught by anyone
+  looking at a screen. Conversion is confined to `app/models/money.py`.
+- **Sub-cent input raises rather than rounds.** `to_cents` rejects anything finer than a cent
+  via `SubCentPrecisionError`. A parser emitting fractional cents has misread the layout;
+  rounding would discard that evidence.
+- **Derived values rule:** stored amounts are always exact integer cents; ratios, averages and
+  percentages are computed in `Decimal` at read time and never written back as if exact. This
+  binds the analytics work in build-plan #7.
+- **`Statement` stays parsed-only.** A row only ever describes a statement that parsed. Files
+  that failed extraction, or fell below the detection threshold (REQ-DET-002), have no bank,
+  dates, balances or parser version - all `NOT NULL` here - so they belong on `statement_jobs`
+  (REQ-PROC-002, build-plan #5). This keeps the invariant that an existing `Statement` row is
+  trustworthy. Rejected alternative: a nullable `Statement` row per uploaded file carrying the
+  whole lifecycle; rejected because it makes ~10 columns nullable and forces an "is this
+  actually parsed?" guard into every downstream query.
+  Therefore `extraction_status` is constrained to `SUCCESS` / `PARTIAL`.
+- **`validation_result` added** as a separate nullable column (`VALID`/`WARNING`/`FAILED`),
+  enforcing the REQ-VAL-004 separation: extraction answers "could we read it", validation
+  answers "do the numbers reconcile". A test asserts they vary independently.
+
+### Changes
+
+- New `src/app/models/money.py`: `to_cents` / `to_decimal`, the only place the two
+  representations meet.
+- `canonical.py`: `amount` -> `amount_cents`, `balance_after` -> `balance_after_cents`,
+  `opening_balance`/`closing_balance` -> `*_cents`, all `int`. Added `validation_result`.
+  Added CHECK constraints and indexes on all four FK columns.
+- `db.py`: `PRAGMA foreign_keys=ON` via an `Engine`-level `connect` listener, deliberately
+  registered on the `Engine` class rather than one instance so tests are covered too.
+- New `tests/conftest.py` with shared fixtures that import `app.db`, so the suite exercises the
+  same engine configuration as the application. The old fixture built a bare engine, which is
+  precisely why defect 2 was invisible.
+- Migration `514aa3a0a621` revised in place rather than stacking a corrective migration - the
+  branch is unmerged and `data/` is gitignored, so there is no released schema to preserve.
+
+### Tests
+
+29 passing, up from 2. New coverage: exact round-trip at large magnitude, reconciliation
+arithmetic asserted with zero tolerance, FK rejection for orphan transactions and statements,
+CHECK rejection for bad direction / negative amount / bad extraction_status / bad batch status /
+bad validation_result, and the REQ-VAL-004 independence case.
+
+**Mutation-checked:** with `PRAGMA foreign_keys=ON` temporarily removed, both orphan tests fail
+("DID NOT RAISE IntegrityError") and pass again once restored - confirming they test the
+protection rather than decorating it.
+
+**Migration verified** against a scratch database (the dev `app.db` was locked by DB Browser):
+INTEGER money columns, no float columns left, 4 indexes, 5 CHECK constraints.
+
+### Known issues / open items
+
+- `apps/backend/data/app.db` still holds the OLD schema. It could not be deleted while DB
+  Browser held it open, and Alembic saw the version already at head and did nothing. It must be
+  deleted and `alembic upgrade head` re-run with the file closed.
+- **Ruff is not installed.** `CLAUDE.md` sections 17 and 24 both reference `ruff check` /
+  `ruff format`, but it is not in `pyproject.toml` and `uv run ruff` fails with "program not
+  found". Either add it as a dev dependency or drop those sections; right now the repo's stated
+  conventions do not match its tooling.
+- `Statement` has no `source_filename`. REQ-REV-003 requires a failed statement to offer a
+  re-upload prompt, which needs a filename to show. Under the parsed-only decision that field
+  belongs on `statement_jobs` - noted so it is not lost in build-plan #5.
+- `statement_jobs` rows must be retained, not pruned on completion, or failure history and the
+  "117 of 120 statements" coverage figure (techstack.md section 9) disappear.
+- `requirements.md` still does not state the storage unit or enumerate `extraction_status` /
+  `validation_result`. Both are now decided in code; the spec should be updated to match.
+
+**Next step:** build-plan.md #3 - intake and validation endpoint.
