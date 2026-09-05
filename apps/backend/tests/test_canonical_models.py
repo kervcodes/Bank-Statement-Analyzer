@@ -195,6 +195,7 @@ def test_invalid_batch_status_is_rejected(session: Session):
             selected=1,
             uploaded=1,
             upload_failed=0,
+            validation_failed=0,
             processed=1,
             processing_failed=0,
             status="DONE",

@@ -10,10 +10,14 @@ The monorepo skeleton runs end to end: Electron launches, spawns the FastAPI bac
 sidecar, and the renderer reads `GET /health` and displays the result. The canonical data model
 (`Batch`, `Account`, `Statement`, `Transaction`) is built on SQLModel with Alembic migrations,
 money stored as integer cents, and schema-level constraints (CHECK constraints, enforced foreign
-keys) backed by a 90%+ test coverage requirement (see [Testing](#testing) below). No parsers,
-intake pipeline, or analytics yet.
+keys) backed by a 90%+ test coverage requirement (see [Testing](#testing) below).
 
-Next up is intake and validation (`build-plan.md` #3). Progress is logged in
+`POST /batches` accepts one or more PDF uploads, validates each independently (rejects non-PDF,
+corrupted, password-protected, oversized, or too-many-page files with a specific reason), and
+tracks every file's status (`IntakeFile`) from the moment it's submitted. No extraction, parsers,
+job queue, or analytics yet.
+
+Next up is the extraction pipeline (`build-plan.md` #4). Progress is logged in
 [`docs/activity.md`](./docs/activity.md), and written up for humans as a build log at
 [kervintznoel.com/posts](https://kervintznoel.com/posts/build-log-1-a-window-that-says-ok).
 

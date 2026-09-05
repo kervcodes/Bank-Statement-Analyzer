@@ -34,3 +34,9 @@ engine = create_engine(DATABASE_URL)
 
 def get_session() -> Session:
     return Session(engine)
+
+
+def get_db_session():
+    """FastAPI dependency: yields a Session, closing it after the request."""
+    with get_session() as session:
+        yield session

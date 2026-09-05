@@ -296,3 +296,65 @@ sign-off before editing):
 session's content, and not an actual rendering problem, so left alone.
 
 **Next step:** build-plan.md #3 — intake and validation endpoint.
+
+---
+
+## 2026-09-05 — Intake and validation (build-plan #3)
+
+**Prompt:** build-plan.md #3, tracing to requirements.md §2 (REQ-INT-001 through 006).
+
+**Two open decisions confirmed before implementation:**
+- Size/page limits (REQ-INT-003 doesn't give numbers): 25 MB / 300 pages per file.
+- The `Batch` model (build-plan #2) had no counter for "rejected at validation" even though
+  design-notes.md's upload screen shows four distinct counts (selected/ready/failed/rejected).
+  Added a `validation_failed` column via a new migration rather than overloading
+  `processing_failed`, which `requirements.md`/`techstack.md` tie specifically to later job
+  processing (build-plan #5), not intake validation.
+
+**What was built:**
+- `app/models/intake.py`: new `IntakeFile` model (`intake_file` table) — one row per submitted
+  file, `status` (`ACCEPTED`/`UPLOAD_FAILED`/`VALIDATION_FAILED`), `failure_reason`,
+  `temp_path` (populated only when accepted), `page_count`. This is not the job queue
+  (`statement_jobs`, build-plan #5) — it's the handoff point step 5's worker pool will read
+  `ACCEPTED` rows from to build jobs.
+- `Batch.validation_failed` column (migration `a210b74a5423`).
+- `app/services/intake_validation.py`: `validate_pdf(filename, content)` — non-PDF extension,
+  size limit, corrupted-PDF, password-protected, page-count checks, in that order (cheapest
+  first). Pure function, no FastAPI/DB imports.
+- `app/api/batches.py`: `POST /batches`, `multipart/form-data`, one or more files. Creates the
+  `Batch` row first (REQ-INT-006), then validates each file independently — one file's failure
+  never stops the loop (REQ-INT-005). Batch status becomes `PROCESSING` if at least one file was
+  accepted, `FAILED` if none were (no queue exists yet to hand accepted files to).
+- Accepted files get written to `apps/backend/data/tmp/<batch_id>/<intake_file_id>.pdf`.
+
+**A real correctness case found while writing the validation service:** some banks encrypt
+PDFs to restrict printing/copying but leave the user password empty — those open without a
+password prompt and aren't what REQ-INT-003 means by "password-protected." Naively rejecting
+anything `pypdf` reports as `is_encrypted` would have misclassified those as password-protected.
+Fixed: only reject when `PdfReader.decrypt("")` actually fails (`PasswordType.NOT_DECRYPTED`).
+Covered by `test_owner_only_encryption_is_accepted`.
+
+**Dependencies added:** `pypdf` (reading PDF structure/encryption/page-count without pulling in
+the heavier `pdfplumber`/`pdfminer.six` stack a step early — that's build-plan #4's job),
+`python-multipart` (required by FastAPI for `UploadFile`), `httpx` (dev-only, required by
+FastAPI's `TestClient`).
+
+**Tests:** `test_intake_validation.py` (7 cases: valid PDF, non-PDF extension, corrupted PDF,
+real password, owner-only/empty-password encryption, oversized file, too many pages — all PDF
+fixtures generated on the fly with `pypdf.PdfWriter`, no binary fixtures committed for this
+step) and `test_batches_api.py` (a mixed 4-file batch asserting distinct per-file statuses/
+reasons and correct batch counts, plus an all-rejected batch asserting `status: FAILED`). Also
+added `test_main.py` for `/health` — main.py had 0% coverage (a known gap flagged by the
+previous task) and this task was already touching that file to wire in the new router, so
+closed it rather than leaving it to accumulate further.
+
+**Known, deliberately untested path:** `IntakeFile.status == "UPLOAD_FAILED"` — the branch
+exists (an `OSError` from `UploadFile.read()`) but by the time a multipart request reaches this
+endpoint, Starlette has already fully parsed it into `UploadFile` objects, so this is not
+realistically reachable via `TestClient` without mocking internals. Left uncovered rather than
+writing a test that verifies a mock instead of real behavior; noted here instead.
+
+**Verified:** `uv run pytest` — 39 passed, 96% coverage (gate: 90%). `uv run ruff check .` and
+`uv run ruff format --check .` both clean.
+
+**Next step:** build-plan.md #4 — extraction pipeline.

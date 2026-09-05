@@ -29,6 +29,7 @@ def batch(session: Session) -> Batch:
         selected=1,
         uploaded=1,
         upload_failed=0,
+        validation_failed=0,
         processed=1,
         processing_failed=0,
         status="COMPLETED",

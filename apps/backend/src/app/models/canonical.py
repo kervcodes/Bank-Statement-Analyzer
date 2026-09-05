@@ -1,7 +1,11 @@
 from datetime import UTC, date, datetime
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from sqlmodel import CheckConstraint, Field, Relationship, SQLModel
+
+if TYPE_CHECKING:
+    from app.models.intake import IntakeFile
 
 # Allowed values for the constrained state columns. Kept next to the models so
 # the CHECK constraints and any Python-side validation read from one list.
@@ -36,11 +40,13 @@ class Batch(SQLModel, table=True):
     selected: int
     uploaded: int
     upload_failed: int
+    validation_failed: int
     processed: int
     processing_failed: int
     status: str
 
     statements: list["Statement"] = Relationship(back_populates="batch")
+    intake_files: list["IntakeFile"] = Relationship(back_populates="batch")
 
 
 class Account(SQLModel, table=True):
