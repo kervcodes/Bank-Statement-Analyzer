@@ -172,6 +172,7 @@ Priority note: every requirement is **Must** unless tagged otherwise. A `(Should
 
 - **NFR-MAINT-001**: Each bank/layout parser shall have its own automated regression test using a real or representative sample statement, per `techstack.md` section 14.
 - **NFR-MAINT-002**: Financial reconciliation, deduplication confidence scoring, and retry state transitions shall each have dedicated unit tests, since these are the components most likely to silently produce wrong financial conclusions if broken.
+- **NFR-MAINT-003**: Backend test coverage shall not fall below 90% (enforced by `apps/backend/pyproject.toml`, `[tool.coverage.report] fail_under = 90`, the single source of truth for the number). A local pre-push git hook and the CI check on every PR against `main` both run the same suite, so a drop below the threshold blocks the push and blocks the merge, not just one or the other.
 
 #### 17.6 Cost
 

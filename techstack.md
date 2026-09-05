@@ -168,7 +168,7 @@ This is the part with the most real engineering risk, budget time for it:
 
 Three workflows, kept separate per your usual dev/staging/prod split, adapted for a desktop app (no staging environment here, since there's no server to stage):
 
-- **`ci.yml`** (on every PR): `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy .`, `uv run pytest`, plus `pnpm lint` and `pnpm test` for the frontend.
+- **`ci.yml`** (on every PR against `main`, and on push to `main`): currently `uv run ruff check .`, `uv run ruff format --check .`, and `uv run pytest` for the backend, with a 90% coverage floor enforced by pytest-cov (`requirements.md` NFR-MAINT-003) rather than a separate CI-only check. `uv run mypy .` and frontend `pnpm lint`/`pnpm test` are not wired in yet — no `mypy` config exists yet, and `apps/desktop` has no test script to run.
 - **`build.yml`** (on every PR, optional but recommended): builds unsigned installers for Windows and macOS as a smoke test that packaging still works, without publishing them.
 - **`release.yml`** (on a version tag): full PyInstaller + electron-builder build, produces signed installers (code signing certs needed for a clean install experience, especially on macOS) and attaches them to a GitHub release.
 

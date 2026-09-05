@@ -1,0 +1,24 @@
+#!/bin/sh
+# Blocks the push if the backend test suite fails, including the coverage
+# gate (currently 90%, set in apps/backend/pyproject.toml under
+# [tool.coverage.report]). Activate with: git config core.hooksPath .githooks
+
+repo_root=$(git rev-parse --show-toplevel) || exit 1
+backend_dir="$repo_root/apps/backend"
+
+if [ ! -d "$backend_dir" ]; then
+    exit 0
+fi
+
+echo "pre-push: running backend test suite (coverage gate included)..."
+cd "$backend_dir" || exit 1
+uv run pytest -q
+status=$?
+
+if [ "$status" -ne 0 ]; then
+    echo ""
+    echo "pre-push: blocked. Backend tests failed or coverage is below the required threshold."
+    echo "Fix the failure (or discuss changing the threshold in pyproject.toml) before pushing."
+fi
+
+exit $status
