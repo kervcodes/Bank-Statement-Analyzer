@@ -240,11 +240,20 @@ requirement), `techstack.md` §15 corrected to describe what `ci.yml` actually r
 description rather than left aspirational), and the root README's stale "Status" section
 (still said "no schema yet" — fixed) plus a new Testing section.
 
-**Known issue / still needs your call:** branch protection on `main` (the actual merge block)
-is a GitHub repo setting, not a code change — not applied yet, pending confirmation.
+**Branch protection on `main`** (approved): opened PR #5 for this work against `main` first,
+so the `backend` CI check would actually run once and confirm its real name before wiring
+protection to it (it ran and passed in 8s). Configured via `gh api` —
+`required_status_checks.contexts: ["backend"]`, `allow_force_pushes: false`,
+`allow_deletions: false`, `enforce_admins: false` (solo project — the admin can still bypass
+in an emergency). Verified with a follow-up `GET` on the protection endpoint.
 
-**Next step:** confirm branch protection, then build-plan.md #3 — intake and validation
-endpoint.
+**Noticed, not touched:** PR #5's checks also showed two failing Vercel deployments
+("backend" and "desktop") plus a passing CodeRabbit/Vercel-preview-comments check — none of
+which this task set up. This project isn't a Vercel deployment target, so these read as a
+leftover or misconfigured integration. Not required by the new branch protection rule (only
+`backend`, this task's own check, is required); flagged for the user rather than touched.
+
+**Next step:** build-plan.md #3 — intake and validation endpoint.
 
 ---
 

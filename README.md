@@ -107,9 +107,10 @@ clone (git doesn't auto-run hooks outside `.git/hooks/`):
 git config core.hooksPath .githooks
 ```
 
-CI (`.github/workflows/ci.yml`) runs the same checks on every PR against `main`. Merging is
-meant to require that check to pass — enforced via a GitHub branch protection rule on `main`,
-configured separately from this repo's code.
+CI (`.github/workflows/ci.yml`) runs the same checks on every PR against `main`. `main` is
+branch-protected to require the `backend` check before merging (no force-pushes, no branch
+deletion; the repo admin can still bypass in an emergency — `enforce_admins` is off since
+this is a solo project).
 
 ## Project structure
 

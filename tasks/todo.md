@@ -61,10 +61,11 @@ mechanisms:
 
 ## 4. Branch protection (the actual merge block — needs your call)
 
-- [ ] Configure GitHub branch protection on `main` requiring the new CI check to pass before
-      merging. **This is a repo-wide GitHub setting, not a code change** — I'll do it via
-      `gh api` if you confirm, since it affects how every future PR merges, not just this one.
-      **NOT DONE — awaiting your confirmation.**
+- [x] Configured GitHub branch protection on `main` (approved) via `gh api`: requires the
+      `backend` status check to pass before merging, blocks force-pushes and branch deletion.
+      `enforce_admins` left off (solo project — the repo admin can still bypass in an
+      emergency). Confirmed the check name by opening PR #5 against `main` first and watching
+      it actually run (`backend` — pass, 8s) before wiring protection to it.
 
 ## 5. Documentation
 
@@ -80,9 +81,9 @@ mechanisms:
 ## Review
 
 **What was completed:** a 90% backend test-coverage floor, enforced two ways — a local
-pre-push git hook (blocks the push) and a GitHub Actions CI workflow (blocks the merge, once
-branch protection is turned on — see item 4). Both just run `uv run pytest`; the threshold
-lives in exactly one place (`pyproject.toml`).
+pre-push git hook (blocks the push) and a GitHub Actions CI workflow plus branch protection on
+`main` (blocks the merge). Both mechanisms just run `uv run pytest`; the threshold lives in
+exactly one place (`pyproject.toml`).
 
 **Found and fixed along the way:** `main` was stuck at just the monorepo skeleton — the PR
 stack meant PR #2 and #3 merged into their own base branches, never reaching `main`. Opened
@@ -100,10 +101,12 @@ and got merged PR #4 to catch `main` up (no code changes, pure sync). Confirmed 
 
 **Known issues:**
 
-- Branch protection on `main` — the actual GitHub-side merge block — is not configured yet.
-  CI will report a status, but nothing currently stops a merge without it passing.
 - `main.py` (FastAPI app + `/health`) has 0% test coverage. Total is still 92% so the gate
   isn't blocked by it, but it's a real, known gap — not fixed here to avoid scope creep.
+- Two unrelated checks (Vercel deployments for "backend" and "desktop") are failing on PRs
+  against `main` — pre-existing, not something this task set up, and not required by branch
+  protection (only `backend`, this task's own CI check, is required). This project isn't a
+  Vercel deployment target, so those look like a leftover/misconfigured integration; flagged
+  for you, not touched here.
 
-**Recommended next step:** confirm branch protection on `main`, then build-plan.md #3 —
-intake and validation endpoint.
+**Recommended next step:** build-plan.md #3 — intake and validation endpoint.
