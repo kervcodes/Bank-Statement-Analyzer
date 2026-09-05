@@ -186,3 +186,45 @@ INTEGER money columns, no float columns left, 4 indexes, 5 CHECK constraints.
   `validation_result`. Both are now decided in code; the spec should be updated to match.
 
 **Next step:** build-plan.md #3 - intake and validation endpoint.
+
+---
+
+## 2026-09-05 — Close out: rebuild dev DB, install ruff, update requirements.md
+
+**Prompt:** "do one more run to assure all is tied/correct. install ruff is okay. make
+documentation is up to date" — closing the three open items left by the previous entry.
+
+**Rebuilt `data/app.db`:** DB Browser for SQLite still held the file open, and several stale
+backend dev processes (uvicorn + two bare Python REPLs, all under this project's `.venv`) from
+earlier sessions were also holding connections. Closed all of them, deleted `data/app.db`, ran
+`alembic upgrade head` fresh. Verified directly via `sqlite3`: all money columns are `INTEGER`,
+5 CHECK constraints present (`ck_batch_status`, `ck_statement_extraction_status`,
+`ck_statement_validation_result`, `ck_transaction_direction`,
+`ck_transaction_amount_non_negative`), 4 indexes present, all four tables plus
+`alembic_version` exist. `uv run pytest` — 29 passed.
+
+**Installed ruff** (`uv add --dev ruff`, approved). `ruff check .` found 13 issues, all style:
+unsorted imports, `Union[...]` → `X | Y`, `datetime.utcnow()`'s replacement already handled
+manually last task, `datetime.now(timezone.utc)` → `datetime.now(datetime.UTC)`, and a
+`dict()`-as-literal rewrite in a test helper. 12 auto-fixed with `--fix`; the `dict()` one
+wasn't offered an automatic fix, so fixed by hand. `ruff format .` reformatted 3 files
+(quote style, wrapping) — no semantic changes. Rebuilt the dev DB again and re-ran the full
+suite after both passes to confirm nothing broke: still 29 passed.
+
+**Updated `requirements.md`** (approved — this is normally a spec file requiring explicit
+sign-off before editing):
+
+- Added REQ-NORM-006: monetary fields are stored as integer minor units; sub-cent precision
+  is rejected, not rounded.
+- Added REQ-VAL-005: a `Statement` row only ever represents a successfully parsed document;
+  failed/unsupported files live on the statement job instead.
+- Expanded REQ-VAL-004 to name the two concrete fields now implementing that separation
+  (`extraction_status`, `validation_result`) and their allowed values.
+- Fixed REQ-NORM-004's stale `source_statement_id` to `statement_id`, matching the field name
+  actually implemented (the naming decision from build-plan #2's spec-gap review).
+
+**Not touched:** `tasks/todo.md`'s pre-existing prose from the previous entry (a
+`build-plan\n#5` line wrap trips a markdownlint false-positive on ATX headings) — not this
+session's content, and not an actual rendering problem, so left alone.
+
+**Next step:** build-plan.md #3 — intake and validation endpoint.

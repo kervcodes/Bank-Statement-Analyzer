@@ -8,12 +8,12 @@ from app.models import SubCentPrecisionError, to_cents, to_decimal
 @pytest.mark.parametrize(
     ("amount", "cents"),
     [
-        (Decimal("0"), 0),
+        (Decimal(0), 0),
         (Decimal("0.00"), 0),
         (Decimal("0.01"), 1),
         (Decimal("0.10"), 10),
         (Decimal("15.99"), 1599),
-        (Decimal("1000"), 100_000),
+        (Decimal(1000), 100_000),
         # The value that exposed the original float storage bug.
         (Decimal("12345678.91"), 1_234_567_891),
     ],

@@ -9,17 +9,17 @@ from app.models import Account, Statement, Transaction, to_cents, to_decimal
 
 
 def _transaction(statement_id: str, **overrides) -> Transaction:
-    defaults = dict(
-        statement_id=statement_id,
-        transaction_date=date(2026, 1, 5),
-        posted_date=date(2026, 1, 6),
-        description_raw="NETFLIX.COM",
-        description_normalized="Netflix",
-        amount_cents=to_cents(Decimal("15.99")),
-        direction="DEBIT",
-        source_bank="Chase",
-        source_page=1,
-    )
+    defaults = {
+        "statement_id": statement_id,
+        "transaction_date": date(2026, 1, 5),
+        "posted_date": date(2026, 1, 6),
+        "description_raw": "NETFLIX.COM",
+        "description_normalized": "Netflix",
+        "amount_cents": to_cents(Decimal("15.99")),
+        "direction": "DEBIT",
+        "source_bank": "Chase",
+        "source_page": 1,
+    }
     defaults.update(overrides)
     return Transaction(**defaults)
 
@@ -28,9 +28,7 @@ def _transaction(statement_id: str, **overrides) -> Transaction:
 
 
 def test_statement_round_trip(session: Session, statement: Statement):
-    fetched = session.exec(
-        select(Statement).where(Statement.id == statement.id)
-    ).one()
+    fetched = session.exec(select(Statement).where(Statement.id == statement.id)).one()
 
     assert fetched.bank == "Chase"
     assert fetched.opening_balance_cents == 100_000
@@ -53,9 +51,7 @@ def test_statement_with_transactions_round_trip(session: Session, statement: Sta
     )
     session.commit()
 
-    fetched = session.exec(
-        select(Statement).where(Statement.id == statement.id)
-    ).one()
+    fetched = session.exec(select(Statement).where(Statement.id == statement.id)).one()
 
     assert len(fetched.transactions) == 2
     assert {t.direction for t in fetched.transactions} == {"DEBIT", "CREDIT"}

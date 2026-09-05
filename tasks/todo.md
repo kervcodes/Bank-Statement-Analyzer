@@ -165,21 +165,28 @@ reconciliation; these sit one layer below it.
 ## 8. Close out
 
 - [x] `uv run pytest` — 29 passed
-- [ ] ~~`uv run ruff check .` and `uv run ruff format --check .`~~ **NOT RUN.** Ruff is not
-      installed and is absent from `pyproject.toml`; `uv run ruff` fails with "program not
-      found". `CLAUDE.md` §17 and §24 assume a linter this project never had. Not installing
-      one unprompted (§11). Needs a decision: add ruff, or amend those sections.
+- [x] Ruff installed and run (approved 2026-09-05): `uv add --dev ruff`, `uv run ruff check .`
+      found 13 style issues (import sorting, `Union`/`X|Y` modernization, `datetime.UTC`,
+      a `dict()`-as-literal rewrite in a test) — none were correctness bugs. 12 auto-fixed,
+      1 (`dict()` → literal) fixed by hand since ruff didn't offer an automatic fix for it.
+      `uv run ruff format .` reformatted 3 files, purely cosmetic (quote style, line
+      wrapping). Re-ran the full test suite after both — still 29 passed.
 - [x] Append to `docs/activity.md`: the three defects, how each was found, the decision and
       its rejected alternative
 - [x] Draft a decision note for `09 Decisions/` in the vault covering integer cents vs.
       `Decimal`-as-TEXT, with the reasoning and the rejected option preserved
 - [x] Second decision note: `Statement` is parsed-only, failures live on `statement_jobs`,
       with the nullable-Statement alternative and why it was rejected
-- [ ] Update `requirements.md` §6 to state the storage unit (integer minor units) and §8 to
-      record the `extraction_status` / `validation_result` enumerations, so the spec stops
-      being silent on both — **NOT DONE, awaiting approval: this is a spec file**
-- [ ] Rebuild `data/app.db` — **BLOCKED**, DB Browser holds the file open. Migration itself
-      already verified against a scratch database.
+- [x] Updated `requirements.md` (approved 2026-09-05): added REQ-NORM-006 (integer minor
+      units, reject sub-cent input rather than round), REQ-VAL-005 (`Statement` is
+      parsed-only), and expanded REQ-VAL-004 to name the two concrete fields
+      (`extraction_status`, `validation_result`) and their values. Also fixed
+      REQ-NORM-004's stale `source_statement_id` to the field name actually implemented,
+      `statement_id` (per the naming decision from build-plan #2).
+- [x] Rebuilt `data/app.db` — DB Browser (and several stale backend dev processes still
+      holding a connection) had the file locked; closed them and re-ran
+      `alembic upgrade head`. Verified via direct SQLite inspection: `INTEGER` money columns,
+      5 CHECK constraints, 4 indexes, all four tables present.
 - [x] Commit `feature/canonical-schema`
 
 ## Out of scope
