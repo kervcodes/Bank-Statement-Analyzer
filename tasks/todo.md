@@ -1,76 +1,115 @@
-# Todo: Scaffolding — apps/desktop + apps/backend skeleton
+# Todo: Canonical schema and local database
 
-Source: `build-plan.md` §1, `techstack.md` §17 (repo structure), §3 (frontend stack), §4 (backend stack), §13 (process lifecycle / health check).
+Source: `build-plan.md` #2, `techstack.md` §9 (canonical schema), `requirements.md` §6
+(REQ-NORM-*) and §7 (REQ-ACC-*).
 
-Goal for this task only: the monorepo skeleton exists and one thing works end to end —
-Electron starts the FastAPI backend in dev mode, the renderer calls `GET /health` on load,
-and shows the result on screen. No canonical schema, no DB, no parsers, no packaging yet —
-those are later build-plan prompts.
+Goal for this task only: `Batch`, `Statement`, `Transaction`, `Account` as SQLModel classes,
+Alembic wired up, a local SQLite database created from this schema. No API endpoints, no
+validation/dedup/analytics logic — just the models, the migration, and round-trip tests.
 
-Branch: `feature/monorepo-skeleton`
+Branch: `feature/canonical-schema` (stacked on `docs/verification-and-cleanup` → `feature/monorepo-skeleton` → `main`, since PRs #1/#2 are still open)
 
-## Backend — `apps/backend`
+## Spec gaps found while reading — need your call before I write code
 
-- [x] `uv init` a Python 3.12+ project at `apps/backend` (`pyproject.toml`, `src/app/` layout per techstack §17 and root `.claude.md` §9)
-- [x] `uv add fastapi "uvicorn[standard]"`
-- [x] `src/app/main.py`: FastAPI instance with one route, `GET /health` → `{"status": "ok"}`
-- [x] Confirm `uv run uvicorn app.main:app --port 8420 --reload` serves it (per techstack §4)
-- [x] `apps/backend/README.md` — one paragraph, how to run it standalone
-- [x] (found during verification) Add `CORSMiddleware` (`allow_origins=["*"]`) — without it the browser fetch from the renderer's origin is silently blocked even though curl succeeds
+`techstack.md` §9 only fully defines `Transaction` and `Statement` fields; `Batch` and
+`Account` aren't specified in any *current* doc. The old `architecture.md` (deleted in commit
+`56d1f06`, superseded by `build-plan.md`/`requirements.md`/`techstack.md`) had a full ER
+diagram including both. I'm proposing to carry its `Batch`/`Account` field lists forward since
+nothing newer replaces them, plus two small reconciliations:
 
-## Frontend — `apps/desktop`
+1. **`Transaction.statement_id` vs. `source_statement_id`** — `techstack.md` §9 names the
+   field `statement_id`; `requirements.md` REQ-NORM-004 calls it `source_statement_id`. I read
+   these as the same field described two ways (traceability languagevs. schema language), not
+   two separate fields — there's no signal anywhere of a second, distinct provenance field.
+   **Proposing:** name it `statement_id` (matches the literal schema definition in techstack.md,
+   the doc build-plan #2 cites for the model itself).
+2. **`extraction_confidence` nullable** — not marked optional in techstack.md's list, but the
+   deleted `architecture.md` noted natively-extracted text (via `pdfplumber`) has no confidence
+   source at all — only OCR produces one. This is a real technical constraint, not spec
+   padding. **Proposing:** keep it nullable, matching that reasoning.
+3. **Dropping old-ER fields not in the current docs** — `architecture.md` also had `currency`
+   on `Statement` and `merchant_normalized`/`category_source`/`category_confidence` on
+   `Transaction`. None of these are in `techstack.md` §9's current list, the app is US-only for
+   v1 (no multi-currency need), and the categorization fields belong to build-plan #8, not #2.
+   **Proposing:** leave all of these out now; Alembic makes adding them later a normal
+   migration when #8 actually needs them, not a schema redesign.
+4. **`Statement.account_id` / `Transaction.account_id` nullable** — per the processing flow
+   (intake creates a `Statement` row before parsing; account identity is resolved during
+   extraction/normalization, build-plan #3–#4), a `Statement` can exist before its account is
+   known. **Proposing:** nullable FK now; tightened later if build-plan #3 shows it should
+   always be set by the time a row exists.
 
-- [x] Scaffold Vite + React 19 + TypeScript at `apps/desktop` (`pnpm create vite . --template react-ts`)
-- [x] Add Tailwind CSS 4 (per techstack §3) — base config only, no shadcn/ui components yet, out of scope for this skeleton
-- [x] Add `electron`, `electron-builder`, `vite-plugin-electron`/`vite-plugin-electron-renderer` as dev dependencies
-- [x] `electron/main.ts`:
-  - spawns the backend in dev mode (`uv run uvicorn app.main:app --port 8420 --reload`, `cwd: apps/backend`) as a child process
-  - loads the Vite dev server URL in the BrowserWindow
-  - kills the backend child process on `will-quit`
-  - `contextIsolation: true`, `nodeIntegration: false` (per techstack §3 security note), even though this skeleton doesn't need IPC yet
-- [x] `electron/preload.ts`: empty/minimal preload file, wired but no bridge methods yet (nothing to expose at this stage)
-- [x] `src/App.tsx`: on mount, `fetch('http://127.0.0.1:8420/health')`, render the raw result (status text is enough — no styling polish)
-- [x] `package.json` scripts: `dev` (starts Vite + Electron together via `vite-plugin-electron/simple`), per techstack's dev workflow
-- [x] (found during verification) Set `package.json` `"main": "dist-electron/main.js"` — without it Electron can't find the entry point and shows an "Error launching app" dialog
-- [x] (found during verification) Use `stdio: 'pipe'` + forward stdout/stderr, and attach an `'error'` listener on the spawned backend process — `stdio: 'inherit'` threw synchronously in this environment, and an unhandled `'error'` event on a Node `ChildProcess` crashes the process
+If any of these calls seem wrong, say so before I implement — this is exactly the kind of
+decision that's cheap to change now and annoying to migrate later.
 
-## Wiring / repo-level
+## Proposed fields (pending the above)
 
-- [x] Root-level scripts or docs for running both halves in dev — added root `README.md` (less duplication than the Vite template's `apps/desktop/README.md`)
-- [x] Confirm `.gitignore` already covers `node_modules/`, `.venv/`, `dist/`, backend build output — added `dist-electron/` to `apps/desktop/.gitignore`, not covered by the Vite template default
-- [x] Manual verification: `pnpm dev` launches Electron; backend confirmed serving `/health` with `200 {"status":"ok"}` and the correct CORS header for the renderer's origin, and the window opens with no crash dialog. **Confirmed on screen by the user on 2026-09-04** — the Electron window renders the health card with `{"status":"ok"}`. End-to-end skeleton verified.
+- **Batch**: `id` (str/UUID, PK), `created_at` (datetime), `selected` (int), `uploaded` (int),
+  `upload_failed` (int), `processed` (int), `processing_failed` (int), `status` (str —
+  `PROCESSING` / `COMPLETED` / `COMPLETED_WITH_WARNINGS` / `FAILED`)
+- **Account**: `id` (str/UUID, PK), `bank` (str), `account_type` (str),
+  `account_identifier_masked` (str)
+- **Statement**: `id` (str/UUID, PK), `batch_id` (FK → Batch), `account_id` (FK → Account,
+  nullable), `bank` (str), `account_type` (str), `account_identifier_masked` (str),
+  `statement_start_date` (date), `statement_end_date` (date), `opening_balance` (Decimal),
+  `closing_balance` (Decimal), `parser_version` (str), `extraction_status` (str)
+- **Transaction**: `id` (str/UUID, PK), `statement_id` (FK → Statement), `account_id` (FK →
+  Account, nullable), `transaction_date` (date), `posted_date` (date), `description_raw` (str),
+  `description_normalized` (str), `amount` (Decimal, positive), `direction` (str —
+  `DEBIT`/`CREDIT`), `balance_after` (Decimal, optional), `category` (str, optional),
+  `source_bank` (str), `extraction_confidence` (float, optional/nullable), `source_page` (int)
 
-## Out of scope for this task (confirmed against techstack.md / build-plan.md)
+## Backend work
 
-- SQLModel/Alembic, canonical schema (build-plan #2)
-- Any real API routes beyond `/health`
-- shadcn/ui, TanStack Query, Zustand, Recharts, React Hook Form/Zod — real dependencies for later screens, not needed for a health-check skeleton
-- PyInstaller/electron-builder packaging (build-plan #10)
-- CI workflows
+- [x] `uv add sqlmodel alembic`
+- [x] `uv add --dev pytest`
+- [x] `src/app/models/canonical.py` — the four SQLModel table classes above
+- [x] `src/app/db.py` — engine/session setup, SQLite path at `apps/backend/data/app.db` (already
+  covered by the repo's root `.gitignore` `data/` rule — never committed)
+- [x] `uv run alembic init alembic`, wire `alembic/env.py` to `SQLModel.metadata` and the app's
+  DB URL
+- [x] `uv run alembic revision --autogenerate -m "create canonical schema"`, review the
+  generated migration by hand before applying
+- [x] (found during review) autogenerate emitted `sqlmodel.sql.sqltypes.AutoString()` without
+  importing `sqlmodel` — a known gap in Alembic's default template with SQLModel. Fixed the
+  generated migration directly and patched `alembic/script.py.mako` so future migrations don't
+  hit the same `NameError`.
+- [x] `uv run alembic upgrade head` — confirmed `data/app.db` created with all four tables
+  (`account`, `batch`, `statement`, `transaction`) plus `alembic_version`
+- [x] `tests/test_canonical_models.py` — in-memory SQLite engine (isolated from the dev DB),
+  write and read back a `Statement` with related `Transaction` rows, assert the round-trip
+
+## Out of scope for this task
+
+- Any API endpoints
+- Validation logic (build-plan #6), dedup (#7), analytics (#7), categorization (#8)
+- `ValidationResult`/`AnalyticsResult` tables — not requested by build-plan #2, added when
+  their consuming logic is actually built
 
 ## Review
 
-**What was completed:** Monorepo skeleton at `apps/backend` (uv + FastAPI, `GET /health`) and
-`apps/desktop` (Vite + React 19 + TS + Tailwind 4 + Electron via `vite-plugin-electron/simple`).
-Electron's main process spawns the backend in dev mode and kills it on `will-quit`; the renderer
-fetches `/health` on mount and renders the result. Root `README.md` added for the combined dev
-workflow.
+**What was completed:** `Batch`, `Account`, `Statement`, `Transaction` SQLModel classes in
+`src/app/models/canonical.py`, per the reconciled field lists above (approved: `statement_id`
+naming, nullable `extraction_confidence`/`account_id`, old-ER fields not in current docs
+dropped). Alembic wired up (`alembic/env.py` imports `SQLModel.metadata` and the app's DB URL
+from `src/app/db.py`), one migration generated and applied, SQLite database created at
+`apps/backend/data/app.db` (gitignored). Two round-trip tests in `tests/test_canonical_models.py`.
 
 **Tests/checks run:**
-- `uv run uvicorn app.main:app --port 8420 --reload` standalone → `curl /health` → `200 {"status":"ok"}`
-- `pnpm dev` (full stack) → backend confirmed reachable on `127.0.0.1:8420` with the correct
-  `access-control-allow-origin` header for the renderer's origin
-- Electron window opens with title "desktop" and normal menu, no crash dialog
+
+- `uv run alembic revision --autogenerate -m "create canonical schema"` → detected all four
+  tables correctly
+- `uv run alembic upgrade head` → verified via `sqlite3`/Python that `account`, `batch`,
+  `statement`, `transaction`, `alembic_version` all exist in `data/app.db`
+- `uv run pytest -v` → 2 passed, no warnings
 
 **Known issues:**
-- ~~On-screen render not visually confirmed.~~ Resolved 2026-09-04: user confirmed the rendered
-  window showing `{"status":"ok"}`. Screenshot published with the build-log post.
-- `uv run uvicorn --reload` did not reliably kill/replace its old worker process on Windows during
-  this session (had to fully kill the process tree once to pick up a code change). Not a skeleton
-  defect, but worth knowing if `--reload` seems to silently ignore a change later.
-- `stdio: 'inherit'` on the spawned backend threw when launched via a non-interactive shell in
-  this environment; switched to `'pipe'` + manual forwarding. Should be fine when launched
-  normally from a terminal, but flagging in case it recurs.
 
-**Recommended next step:** build-plan.md #2 — canonical schema (SQLModel) + Alembic + local SQLite,
-no API endpoints yet.
+- Alembic's autogenerated migration referenced `sqlmodel.sql.sqltypes.AutoString()` without
+  importing `sqlmodel` — would have raised `NameError` on `alembic upgrade`. Fixed in the
+  generated file and in `alembic/script.py.mako` so it won't recur on future migrations.
+- No API endpoints wire these models in yet (by design — out of scope for this task).
+
+**Recommended next step:** build-plan.md #3 — intake and validation endpoint
+(REQ-INT-001–006), which will be the first thing to actually create `Batch`/`Statement` rows
+through the API rather than directly in tests.
