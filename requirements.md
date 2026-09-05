@@ -57,8 +57,9 @@ Priority note: every requirement is **Must** unless tagged otherwise. A `(Should
 - **REQ-NORM-001**: Every parser shall output transactions and statement metadata in the shared canonical schema defined in `techstack.md` section 9, regardless of source institution.
 - **REQ-NORM-002**: `description_raw` (the original statement text) shall be preserved unmodified alongside `description_normalized` (cleaned); the raw value shall never be overwritten.
 - **REQ-NORM-003**: `amount` shall be stored as a positive numeric value with an explicit `direction` (DEBIT/CREDIT), never a signed amount alone.
-- **REQ-NORM-004**: Every transaction shall retain `source_statement_id` and `source_page` so it remains traceable to its origin even after the raw PDF is deleted.
+- **REQ-NORM-004**: Every transaction shall retain `statement_id` and `source_page` so it remains traceable to its origin even after the raw PDF is deleted.
 - **REQ-NORM-005**: No component downstream of normalization (validation, dedup, analytics, categorization) shall branch on which bank produced the data.
+- **REQ-NORM-006**: Every monetary field (`amount`, `balance_after`, `opening_balance`, `closing_balance`) shall be stored as an integer count of minor units (cents), never as a float or an unconstrained decimal type; a value with sub-cent precision shall be rejected, not rounded, since it indicates a misread rather than a display rounding case.
 
 ### 7. Account Resolution
 
@@ -72,7 +73,8 @@ Priority note: every requirement is **Must** unless tagged otherwise. A `(Should
 - **REQ-VAL-001**: Every parsed statement shall pass three validation levels before being trusted by analytics: structural (required fields present), transaction-level (valid dates/amounts/direction), and financial reconciliation (opening balance + credits minus debits approximately equals closing balance, within rounding tolerance).
 - **REQ-VAL-002**: Validation result shall be one of `VALID`, `WARNING`, or `FAILED`, not a bare pass/fail, and shall be visible per statement.
 - **REQ-VAL-003**: A statement that fails validation shall be excluded from trusted analytics but shall not remove or invalidate other statements in the same batch.
-- **REQ-VAL-004**: Extraction confidence (how well the text was read) and financial validation (whether the resulting numbers reconcile) shall be tracked as two separate signals, not conflated into one confidence score.
+- **REQ-VAL-004**: Extraction confidence (how well the text was read) and financial validation (whether the resulting numbers reconcile) shall be tracked as two separate signals, not conflated into one confidence score. At the statement level this is two independent fields: `extraction_status` (`SUCCESS` or `PARTIAL` — could the document be read) and `validation_result` (`VALID`/`WARNING`/`FAILED`, nullable until validation runs — do the numbers reconcile). A statement may legally be `SUCCESS` and `FAILED` at once (cleanly read, doesn't reconcile).
+- **REQ-VAL-005**: A `Statement` record shall only ever represent a document that was successfully parsed; a file that failed extraction or fell below the bank-detection confidence threshold (REQ-DET-002) shall not produce a `Statement` row; its failure/unsupported state is tracked on the statement job (section 3) instead.
 
 ### 9. Deduplication
 
