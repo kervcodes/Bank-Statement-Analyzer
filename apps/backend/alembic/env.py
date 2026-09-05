@@ -5,7 +5,7 @@ from sqlmodel import SQLModel
 
 from alembic import context
 from app.db import DATABASE_URL
-from app.models import Account, Batch, Statement, Transaction  # noqa: F401
+from app.models import Account, Batch, IntakeFile, Statement, Transaction  # noqa: F401
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

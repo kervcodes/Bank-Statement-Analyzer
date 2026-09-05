@@ -1,7 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.batches import router as batches_router
+
 app = FastAPI()
+app.include_router(batches_router)
 
 # Single-user local desktop app: the renderer (Vite dev server or a packaged
 # file:// origin) is always cross-origin from this sidecar on 127.0.0.1, and
