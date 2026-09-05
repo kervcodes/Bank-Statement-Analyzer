@@ -6,7 +6,14 @@ Runs entirely on your own machine (Electron desktop app, Python backend, local S
 
 ## Status
 
-Pre-code, spec-complete. This repo currently holds the full design: architecture, tech stack, screens, and requirements, but no application code yet. If you're picking this up to start building, go to [Getting started](#getting-started) below.
+**Scaffolded.** The monorepo skeleton runs end to end: Electron launches, spawns the FastAPI
+backend as a local sidecar, and the renderer reads `GET /health` and displays the result. That's
+the whole of the working software today — no schema, no parsers, no analytics yet.
+
+Everything else in this repo is design: architecture, tech stack, screens, and requirements.
+Next up is the canonical data model (`build-plan.md` #2). Progress is logged in
+[`docs/activity.md`](./docs/activity.md), and written up for humans as a build log at
+[kervintznoel.com/posts](https://kervintznoel.com/posts/build-log-1-a-window-that-says-ok).
 
 ## What it does (v1)
 
@@ -38,28 +45,32 @@ Electron App (installed locally)
          └── Local SQLite database
 ```
 
-The full architecture reasoning (why async processing, why a canonical schema, why the LLM never touches raw numbers) is in [`brainstorming.pdf`](./brainstorming.pdf), a design conversation worked through decision by decision before anything was built.
+The full architecture reasoning (why async processing, why a canonical schema, why the LLM never touches raw numbers) came out of a design conversation worked through decision by decision before anything was built. Its conclusions live in [`techstack.md`](./techstack.md); the source PDF is kept locally and excluded from the repo by the `*.pdf` rule in `.gitignore`.
 
 ## Docs in this repo
 
 | File | What's in it |
 |---|---|
-| [`brainstorming.pdf`](./brainstorming.pdf) | The original architecture design conversation. Read this for the *why* behind every boundary in the system. |
 | [`techstack.md`](./techstack.md) | The concrete stack and every technology decision, with the reasoning behind each one. |
 | [`design-notes.md`](./design-notes.md) | Screen-by-screen UI/UX spec: navigation, wireframes, visual style. |
 | [`requirements.md`](./requirements.md) | The testable requirement list (REQ-IDs), non-functional requirements, and the v1 definition of done. |
 | [`build-plan.md`](./build-plan.md) | The first 10 prompts for building this with Claude Code, in dependency order. |
-| [`.claude.md`](./.claude.md) | Coding conventions Claude Code follows in this repo: planning workflow, Python/uv setup, testing, git branching. |
+| [`CLAUDE.md`](./CLAUDE.md) | Coding conventions Claude Code follows in this repo: planning workflow, Python/uv setup, testing, git branching. |
+| [`docs/activity.md`](./docs/activity.md) | Running log of what was actually built, when, and what broke. |
+| [Build log](https://kervintznoel.com/posts/build-log-1-a-window-that-says-ok) | The public write-up of each milestone — the same story told for people rather than tooling. Hosted on my site, not in this repo. |
 
 ## Getting started
 
-This project isn't scaffolded yet. To start:
+Prerequisites: Node 20+ with `pnpm`, and Python 3.12+ with [`uv`](https://docs.astral.sh/uv/).
 
-1. Open this folder in Claude Code.
-2. Run prompt 1 from [`build-plan.md`](./build-plan.md) to scaffold `apps/desktop` and `apps/backend`.
-3. Continue through the remaining prompts in order, they're sequenced so each one builds on a working, tested version of the last.
+```bash
+# From apps/desktop — starts Vite, Electron, and the backend together
+pnpm install
+pnpm dev
+```
 
-Once scaffolded, the expected local dev workflow (per `techstack.md`) is:
+Electron's main process spawns the backend automatically in dev mode. To run either half on its
+own while iterating:
 
 ```bash
 # Backend (from apps/backend)
@@ -71,7 +82,8 @@ pnpm install
 pnpm dev
 ```
 
-Electron's main process spawns the backend automatically in dev mode once prompt 1 is done, these commands are for running each half independently while iterating.
+To continue building, run the prompts in [`build-plan.md`](./build-plan.md) in order, starting
+from #2 — they're sequenced so each one builds on a working, tested version of the last.
 
 ## Project structure
 
@@ -81,15 +93,14 @@ bank-statements-analyzer/
 │   ├── desktop/       # Electron + React frontend
 │   └── backend/       # Python FastAPI backend (uv-managed)
 ├── docs/
-│   └── activity.md    # Running log of work done, per .claude.md
+│   ├── activity.md    # Running log of work done, per CLAUDE.md
 ├── tasks/
-│   └── todo.md        # Current plan, per .claude.md's planning workflow
+│   └── todo.md        # Current plan, per CLAUDE.md's planning workflow
 ├── techstack.md
 ├── design-notes.md
 ├── requirements.md
 ├── build-plan.md
-├── brainstorming.pdf
-└── .claude.md
+└── CLAUDE.md
 ```
 
 Full rationale for this layout: `techstack.md` section 17.
@@ -100,7 +111,7 @@ Electron + Vite + React + TypeScript + Tailwind on the frontend, Python + FastAP
 
 ## Contributing / conventions
 
-Solo project for now. Coding conventions, the plan-then-approve workflow, testing and linting expectations, and git branching rules are all defined in [`.claude.md`](./.claude.md), read that before making changes.
+Solo project for now. Coding conventions, the plan-then-approve workflow, testing and linting expectations, and git branching rules are all defined in [`CLAUDE.md`](./CLAUDE.md), read that before making changes.
 
 ## License
 

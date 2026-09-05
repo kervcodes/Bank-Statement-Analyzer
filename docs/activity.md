@@ -33,8 +33,24 @@ the result." (build-plan.md #1)
 
 **Verified:** backend `/health` returns `200 {"status":"ok"}` standalone and under `pnpm dev`,
 with the correct CORS header for the renderer's origin; Electron window opens cleanly (title
-"desktop", no crash dialog). Not verified from this environment: the actual on-screen render (no
-screenshot tooling for native Electron windows here) — pending the user confirming on their own
-screen.
+"desktop", no crash dialog). The on-screen render was confirmed by the user on 2026-09-04 — the
+window displays the health card with `{"status":"ok"}` (screenshot published with the build log post).
+Build-plan #1 is complete: the skeleton works end to end.
 
 **Next step:** build-plan.md #2 — canonical schema (SQLModel) + Alembic + local SQLite.
+
+---
+
+## 2026-09-04 — Docs cleanup + first build-log post
+
+**What changed:**
+- `tasks/todo.md`, `docs/activity.md`: closed out the one open verification item from scaffolding.
+- `README.md`: status corrected from "Pre-code, spec-complete" (stale) to scaffolded; fixed the
+  `.claude.md` link (file is `CLAUDE.md`); removed the `brainstorming.pdf` links — that file is
+  excluded by `.gitignore`'s `*.pdf` rule, so those links 404 for anyone reading on GitHub.
+- Wrote the first build-log post — published on the portfolio site (`portfolio-v2`, `src/data/posts.js`)
+  rather than kept in this repo, so there's one copy and no drift. It covers why
+  the project exists, the architecture boundaries chosen before writing code, and why the first
+  screen is only a health check.
+
+**Not code.** No application behavior changed in this entry.
