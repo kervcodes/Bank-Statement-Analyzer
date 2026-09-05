@@ -6,12 +6,14 @@ Runs entirely on your own machine (Electron desktop app, Python backend, local S
 
 ## Status
 
-**Scaffolded.** The monorepo skeleton runs end to end: Electron launches, spawns the FastAPI
-backend as a local sidecar, and the renderer reads `GET /health` and displays the result. That's
-the whole of the working software today — no schema, no parsers, no analytics yet.
+The monorepo skeleton runs end to end: Electron launches, spawns the FastAPI backend as a local
+sidecar, and the renderer reads `GET /health` and displays the result. The canonical data model
+(`Batch`, `Account`, `Statement`, `Transaction`) is built on SQLModel with Alembic migrations,
+money stored as integer cents, and schema-level constraints (CHECK constraints, enforced foreign
+keys) backed by a 90%+ test coverage requirement (see [Testing](#testing) below). No parsers,
+intake pipeline, or analytics yet.
 
-Everything else in this repo is design: architecture, tech stack, screens, and requirements.
-Next up is the canonical data model (`build-plan.md` #2). Progress is logged in
+Next up is intake and validation (`build-plan.md` #3). Progress is logged in
 [`docs/activity.md`](./docs/activity.md), and written up for humans as a build log at
 [kervintznoel.com/posts](https://kervintznoel.com/posts/build-log-1-a-window-that-says-ok).
 
@@ -83,7 +85,32 @@ pnpm dev
 ```
 
 To continue building, run the prompts in [`build-plan.md`](./build-plan.md) in order, starting
-from #2 — they're sequenced so each one builds on a working, tested version of the last.
+from #3 — they're sequenced so each one builds on a working, tested version of the last.
+
+## Testing
+
+Backend tests require **90% coverage** (`apps/backend/pyproject.toml`,
+`[tool.coverage.report] fail_under = 90`) — `uv run pytest` fails on its own if coverage drops
+below that, so the number lives in one place.
+
+```bash
+cd apps/backend
+uv run pytest       # runs with coverage automatically (see addopts)
+uv run ruff check .
+uv run ruff format --check .
+```
+
+A local pre-push hook runs the same suite and blocks the push if it fails. It's opt-in per
+clone (git doesn't auto-run hooks outside `.git/hooks/`):
+
+```bash
+git config core.hooksPath .githooks
+```
+
+CI (`.github/workflows/ci.yml`) runs the same checks on every PR against `main`. `main` is
+branch-protected to require the `backend` check before merging (no force-pushes, no branch
+deletion; the repo admin can still bypass in an emergency — `enforce_admins` is off since
+this is a solo project).
 
 ## Project structure
 

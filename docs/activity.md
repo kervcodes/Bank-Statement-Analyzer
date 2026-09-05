@@ -189,6 +189,74 @@ INTEGER money columns, no float columns left, 4 indexes, 5 CHECK constraints.
 
 ---
 
+## 2026-09-05 — Test coverage requirement: 90% floor, blocks push and merge
+
+**Prompt:** "add a project requirement, blocking new push and merge if [test coverage] is less
+than 90%." Read "score" as test coverage percentage (confirmed no objection).
+
+**Branch mixup caught early:** first branched off `docs/verification-and-cleanup`, which turned
+out to still be missing the canonical schema (see below) — caught before committing anything,
+recreated the branch off the correct tip.
+
+**Found while starting this task: `main` was stuck at just the monorepo skeleton.** The PR
+stack (`main` ← PR #1 ← PR #2 ← PR #3) meant each PR merged into its own base branch, not
+`main` — PR #2 landed on `feature/monorepo-skeleton`, PR #3 landed on
+`docs/verification-and-cleanup`. `main` itself never got either. Confirmed with a direct diff:
+19 files / ~1,900 lines missing from `main` that existed on the real tip of completed work.
+Opened PR #4 (`docs/verification-and-cleanup` → `main`, no code changes, pure catch-up), user
+merged it. Verified after: `git diff origin/main feature/canonical-schema` is empty.
+
+**What "blocking push" and "blocking merge" actually take:** GitHub can't block a `git push`
+itself — pushes always succeed if you have write access; CI only runs after and reports
+pass/fail. So this needed two separate mechanisms: a client-side pre-push hook (blocks push)
+and a CI check + branch protection rule (blocks merge).
+
+**Implemented:**
+- `apps/backend/pyproject.toml`: `[tool.coverage.report] fail_under = 90`, plus `--cov=app
+  --cov-report=term-missing` in pytest's `addopts`. A plain `uv run pytest` now enforces the
+  gate on its own — one number, one place, both the hook and CI just run `uv run pytest`.
+- `.githooks/pre-push`: runs the backend suite, blocks the push on failure. Opt-in per clone
+  via `git config core.hooksPath .githooks` (documented in the root README) — git doesn't
+  auto-run hooks outside `.git/hooks/`.
+- `.github/workflows/ci.yml`: ruff check, ruff format check, pytest (coverage gate included),
+  on every PR against `main` and on push to `main`. Backend only — `apps/desktop` has no test
+  script yet, and adding a fake one would misrepresent what's actually verified.
+- `.gitignore`: added `.coverage`, `htmlcov/`, `.pytest_cache/` (none were ignored before).
+
+**Verified current coverage (before adding any new tests):** 92% total —
+`canonical.py`/`models/__init__.py` 100%, `db.py`/`money.py` 93%, `main.py` 0% (the FastAPI
+app and `/health` route have no automated test yet, only manual curl checks). Already clears
+90%; did not add a `main.py` test in this task since padding coverage the gate doesn't require
+would be scope creep — noted as a known gap instead.
+
+**Mutation-checked the gate itself:** temporarily raised `fail_under` to 95 (above real
+coverage) — `uv run pytest` failed with exit code 1 and printed "Required test coverage of
+95.0% not reached." Restored to 90 and reconfirmed a clean pass. Same check run directly
+against the pre-push hook script.
+
+**Documentation:** `requirements.md` NFR-MAINT-003 (the coverage floor as a stated
+requirement), `techstack.md` §15 corrected to describe what `ci.yml` actually runs today
+(ruff + pytest; `mypy` and frontend `pnpm test` don't exist yet, so removed from the
+description rather than left aspirational), and the root README's stale "Status" section
+(still said "no schema yet" — fixed) plus a new Testing section.
+
+**Branch protection on `main`** (approved): opened PR #5 for this work against `main` first,
+so the `backend` CI check would actually run once and confirm its real name before wiring
+protection to it (it ran and passed in 8s). Configured via `gh api` —
+`required_status_checks.contexts: ["backend"]`, `allow_force_pushes: false`,
+`allow_deletions: false`, `enforce_admins: false` (solo project — the admin can still bypass
+in an emergency). Verified with a follow-up `GET` on the protection endpoint.
+
+**Noticed, not touched:** PR #5's checks also showed two failing Vercel deployments
+("backend" and "desktop") plus a passing CodeRabbit/Vercel-preview-comments check — none of
+which this task set up. This project isn't a Vercel deployment target, so these read as a
+leftover or misconfigured integration. Not required by the new branch protection rule (only
+`backend`, this task's own check, is required); flagged for the user rather than touched.
+
+**Next step:** build-plan.md #3 — intake and validation endpoint.
+
+---
+
 ## 2026-09-05 — Close out: rebuild dev DB, install ruff, update requirements.md
 
 **Prompt:** "do one more run to assure all is tied/correct. install ruff is okay. make
