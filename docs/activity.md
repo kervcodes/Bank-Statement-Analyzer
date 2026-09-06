@@ -419,3 +419,86 @@ real Tesseract binary (not mocked) — `pytesseract.image_to_string` correctly r
 "HELLO SCANNED STATEMENT" from a rendered image with no text layer.
 
 **Next step:** build-plan.md #5 — background job queue.
+
+---
+
+## 2026-09-06 — Background job queue (build-plan #5)
+
+**Prompt:** "continue with build plan #5" — traces to requirements.md §3 (REQ-PROC-001–103),
+NFR-MAINT-002 (retry-state transitions as a must-test area), techstack.md §6.
+
+**Five decisions, all confirmed in `tasks/todo.md` before code:**
+- **Single background thread, sequential poll loop** — deviates from techstack.md §6's
+  `ProcessPoolExecutor`. The queue/retry/coordinator machinery this step is about is identical
+  either way; a process pool on Windows (spawn, picklable work functions, a DB engine per child)
+  makes it far harder to build and test for throughput that is not yet a measured problem.
+  Revisit is contained to `workers/pool.py`.
+- **Extracted text is not persisted** at this step — the job records `extraction_method`
+  (`NATIVE`/`OCR`) and `page_count` for observability, then marks `COMPLETED`. Build-plan #6's
+  parser re-runs extraction as its first step (native text is cheap; OCR is rare).
+- **SQLite WAL + busy_timeout** added to `db.py`'s connect listener — required once a background
+  writer runs alongside request handlers, or concurrent writes raise "database is locked".
+- **New `GET /batches/{batch_id}`** — batch counters, status, per-job list. Needed to verify
+  end-to-end here; build-plan #9's progress screen will poll it.
+- **Worker auto-starts via FastAPI lifespan**; stays off under the suite's bare
+  `TestClient(app)`. Tests drive it explicitly through `run_worker_once()`.
+
+**What was built:**
+- `app/models/jobs.py`: `StatementJob` (`statement_job` table) — `id`, `batch_id` (FK, indexed),
+  `intake_file_id` (FK, indexed), `pdf_path` (a string reference, never the bytes — REQ-PROC-003),
+  `status`, `attempt_count`, `max_attempts` (default 3), `failure_reason`, `extraction_method`,
+  `page_count`, timestamps. Status CHECK constraint + a non-negative `attempt_count` constraint,
+  matching the `canonical.py` / `intake.py` precedent. `UNSUPPORTED` is in the status tuple now
+  (REQ-PROC-002) though nothing produces it until build-plan #6. Migration `06a9bc8c453d`.
+- `app/workers/queue.py`: pure-DB `enqueue_job` / `claim_next_job` / `mark_completed` /
+  `mark_failed` / `record_retryable_failure`. Claiming is a conditional
+  `UPDATE ... WHERE id = ? AND status IN ('QUEUED','RETRYING')` checked by rowcount, so two
+  workers racing the same row can't both win.
+- `app/workers/processor.py`: `process_job` runs `extract_text()`; `ExtractionFailedError` /
+  `RetryableJobError` → `record_retryable_failure` (retry up to 2×, then `FAILED`); any other
+  exception → `mark_failed` + `logger.exception` (REQ-PROC-102, not swallowed). `RetryableJobError`
+  is the classification hook build-plan #6's parser code will raise. Never raises — every outcome
+  is a recorded job state so one bad statement never stops the worker.
+- `app/workers/coordinator.py`: `refresh_batch` — counts a batch's jobs by status in one
+  transaction; while any is non-terminal, leaves the batch `PROCESSING`; once all terminal, sets
+  `processed` / `processing_failed` and flips to `COMPLETED`, or `COMPLETED_WITH_WARNINGS` if any
+  file was excluded at intake or processing (REQ-RPT-002). Idempotent.
+- `app/workers/pool.py`: `run_worker_once(session_factory)` (the seam tests drive) and a
+  `BackgroundWorker` daemon-thread wrapper wired into a new FastAPI `lifespan` in `main.py`.
+- `app/api/batches.py`: enqueues a job for each `ACCEPTED` file after intake (REQ-PROC-004:
+  rejected files never enter the queue); new `GET /batches/{batch_id}`.
+
+**One test failure found and fixed:** `test_req_proc_102` expected `attempt_count == 1` after a
+non-retryable failure, but `mark_failed` didn't count the attempt (only `record_retryable_failure`
+did). Fixed `mark_failed` to increment `attempt_count` too, so the field always reflects how many
+times the job actually ran regardless of which path ended it. (Known small inconsistency left in
+place: a job that succeeds on the first try keeps `attempt_count == 0` — `mark_completed` doesn't
+count. Not worth a broader "increment at claim time" refactor the plan didn't ask for; noted for
+build-plan #6 if it matters then.)
+
+**Test helper extracted:** the hand-built-PDF function from `test_extraction.py` moved to
+`tests/_pdf.py` (`build_pdf`, `NATIVE_TEXT_PAGE`), now shared by the extraction and job-queue
+suites instead of duplicated.
+
+**Tests:** `test_job_queue.py` — happy path, empty-queue, claim-exactly-one / not-reclaimable
+(two-worker race), `test_req_proc_101` retry-twice-then-fail, `test_req_proc_102`
+non-retryable-fails-immediately, coordinator (stays `PROCESSING` until all terminal;
+2×COMPLETED → `COMPLETED`; 1+1 FAILED → `COMPLETED_WITH_WARNINGS`; intake rejection alone →
+warnings), REQ-PROC-003 (path not bytes), REQ-PROC-004 (rejected file gets no job), and a
+`BackgroundWorker` thread lifecycle test (starts, drains the queue on its own, joins cleanly).
+`test_batches_api.py` extended with a `POST /batches` → `run_worker_once` → `GET /batches/{id}`
+end-to-end case and a 404 case.
+
+**Verified:** `uv run pytest` — 57 passed, 96% coverage (gate: 90%). `uv run ruff check .` and
+`uv run ruff format --check .` clean. (Locally, the two OCR extraction tests fail unless
+`C:\Program Files\Tesseract-OCR` is on PATH for the shell — a known build-plan #4 environment
+quirk, not a regression; CI installs tesseract and runs them.) Manual end-to-end against a real
+uvicorn server (lifespan worker running): `POST /batches` with one native-text PDF + one `.txt`
+→ batch `PROCESSING`, one job queued for the PDF only → background thread completed it
+(`extraction_method: NATIVE`) → batch `COMPLETED_WITH_WARNINGS` (the `.txt` was rejected at
+intake) → `GET /batches/{id}` reported it; unknown batch id → 404.
+
+**Repo note:** this branched off `feature/extraction-pipeline` (build-plan #4, PR #7), not
+`main`, so it's a stacked PR — PR #7 should merge first.
+
+**Next step:** build-plan.md #6 — bank detection and parsing.
