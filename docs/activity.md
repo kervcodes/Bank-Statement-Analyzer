@@ -358,3 +358,64 @@ writing a test that verifies a mock instead of real behavior; noted here instead
 `uv run ruff format --check .` both clean.
 
 **Next step:** build-plan.md #4 — extraction pipeline.
+
+---
+
+## 2026-09-05 — Extraction pipeline (build-plan #4)
+
+**Prompt:** build-plan.md #4, tracing to requirements.md §4 (REQ-EXT-001 through 004).
+
+**System check before implementation:** Poppler (`pdftoppm`, needed by `pdf2image`) was already
+installed. Tesseract OCR (needed by `pytesseract`) was not installed anywhere on the machine —
+installed via `winget install tesseract-ocr.tesseract` (v5.5.3, user-approved). The installer
+did not add itself to PATH, so `C:\Program Files\Tesseract-OCR` was added to the user PATH
+environment variable directly (new terminals pick this up automatically; the same-session shell
+this task ran in needed the path exported inline per command since it predates the change).
+
+**Two decisions confirmed by the user before implementation:**
+- Native-vs-OCR routing: a document is never split between methods per page. If any single page
+  fails the native-text check (<40 non-whitespace characters extracted via `pdfplumber`), the
+  *whole* document falls back to OCR — chosen over a "≥80% of pages" threshold, since silently
+  dropping one page's transactions because only that page failed is exactly the kind of quiet
+  inaccuracy this app is built to avoid.
+- Installed Tesseract via the official upstream winget package (`tesseract-ocr.tesseract`
+  5.5.3) rather than the community UB-Mannheim build.
+
+**What was built:**
+- `app/services/extraction.py`: `extract_text(pdf_path) -> ExtractionResult` — the standalone
+  service from build-plan #4, not wired into the job queue (build-plan #5) or bank detection
+  (build-plan #6) yet. `ExtractionResult` (`pages: list[PageText]`, `method: "NATIVE"|"OCR"`)
+  is the single contract both paths converge on (REQ-EXT-003); `PageText` carries a 1-indexed
+  `page_number` so `source_page` traceability (REQ-NORM-004) survives into build-plan #6's
+  parsers.
+- Native path: `pdfplumber` extracts each page's text; any page below the 40-character floor
+  aborts native extraction for the whole document.
+- OCR path: `pdf2image` renders every page to an image, `pytesseract` OCRs each one. Any
+  failure (missing binary, a corrupt render, an engine crash) raises `ExtractionFailedError`
+  rather than returning partial or garbled text (REQ-EXT-004).
+- `.github/workflows/ci.yml`: added an `apt-get install -y poppler-utils tesseract-ocr` step so
+  the OCR-path test actually runs in CI, not just locally.
+
+**Dependencies added:** `pdfplumber`, `pdf2image`, `pytesseract` (runtime); `Pillow` (dev-only —
+already an indirect dependency of `pdf2image`, declared directly since tests import it by name
+to build a synthetic scanned-page fixture).
+
+**Test fixtures — no PDF-writing library added as a dependency:** `pypdf` (already present) has
+no text-drawing API, so the native-text test fixture is a hand-built minimal PDF (object graph
++ xref table constructed directly, real embedded text via a `BT ... Tj ET` content stream). The
+OCR fixture draws text onto a blank image with Pillow and saves it as an image-only PDF (no
+text layer at all), which reliably forces the OCR path and gives `pytesseract` real text to
+recognize rather than mocking the OCR call. A hand-crafted two-page PDF (one real-text page,
+one blank) tests the mixed-document routing decision directly.
+
+**Tests:** `test_extraction.py` — native-text PDF uses the native path; an image-only PDF falls
+back to OCR and recovers the drawn text; a mixed one-good/one-blank-page document routes
+entirely to OCR; a monkeypatched OCR failure raises `ExtractionFailedError` rather than
+returning anything.
+
+**Verified:** `uv run pytest` — 43 passed, 97% coverage (gate: 90%). `uv run ruff check .` and
+`uv run ruff format --check .` both clean. OCR path manually confirmed end-to-end against the
+real Tesseract binary (not mocked) — `pytesseract.image_to_string` correctly recovered
+"HELLO SCANNED STATEMENT" from a rendered image with no text layer.
+
+**Next step:** build-plan.md #5 — background job queue.

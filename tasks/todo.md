@@ -1,156 +1,176 @@
-# Todo: Build-plan #3 — Intake and validation
+# Todo: Build-plan #4 — Extraction pipeline
 
-Source: `build-plan.md` §3, tracing to `requirements.md` §2 (REQ-INT-001 through 006).
+Source: `build-plan.md` §4, tracing to `requirements.md` §4 (REQ-EXT-001 through 004).
 
-Branch: `feature/intake-validation`, based on `main` (currently `9b1c2b0`, which already
-includes the coverage gate from the previous task).
+Branch: `feature/extraction-pipeline`, based on `main` (currently `1409beb`, which includes
+build-plan #3).
 
 ## What already exists vs. what this task adds
 
-- `Batch` (canonical schema, step 2) already has `selected`, `uploaded`, `upload_failed`,
-  `processed`, `processing_failed`, `status`. No per-file table exists yet — `Statement`
-  (step 2) is documented as only ever representing a *parsed* statement, and `statement_jobs`
-  (the job-queue table) doesn't exist until step 5.
-- This task needs somewhere to persist "file X in batch Y was accepted / rejected / failed to
-  upload, and if accepted, where its temp copy lives" — step 5 needs that to build jobs from.
-  Adding a new table for this now, rather than stretching `Statement` or reinventing
-  `statement_jobs` early.
+- Nothing extraction-related exists yet. `IntakeFile.temp_path` (build-plan #3) points at an
+  accepted PDF on disk — this task reads that path and produces text, nothing more.
+- Explicitly **not** wiring into the job queue (`statement_jobs` doesn't exist until build-plan
+  #5) or into bank detection/parsing (build-plan #6). This is a standalone service: PDF path in,
+  extracted text out (or a raised failure).
 
-## Two decisions I want to confirm before writing code
+## System check (done before writing this plan)
 
-**1. Size/page limits (REQ-INT-003 doesn't give numbers).** Proposing **25 MB per file, 300
-pages per file** as the "supported size/page count" ceiling — generous for a real bank/card
-statement (even a dense annual summary), cheap to check before attempting extraction. Tell me
-if you want different numbers.
+- **Poppler** (`pdftoppm`, needed by `pdf2image`): already installed, v24.04.0, on PATH.
+- **Tesseract OCR** (needed by `pytesseract`): **not installed** anywhere on this machine.
+  `pytesseract` calls out to the `tesseract` binary; without it, any OCR-path call raises
+  `TesseractNotFoundError` immediately.
 
-**2. Batch-level counters don't have a slot for "rejected at validation."** Design-notes.md's
-upload screen shows four distinct counts — *selected, ready, failed, rejected* — but `Batch`
-only has `selected / uploaded / upload_failed / processed / processing_failed`. Two ways to
-close that gap:
-   - **(a) Add a `validation_failed` column to `Batch`** via a new Alembic migration. Keeps
-     every state distinct and matches the UI's four counters exactly. Touches the
-     already-merged canonical-schema migration chain (additively, not a rewrite).
-     **Recommended** — REQ-INT-002 specifically requires upload-failure and validation-failure
-     to be distinct *and testable*, and collapsing them into one counter at the batch level
-     would undercut that at the one place (the batch summary) where it's most visible.
-   - (b) Reuse `processing_failed` to mean "any file that will never become a Statement,"
-     whether the cause is validation-rejection now or an extraction/parsing failure later
-     (step 4-6). No schema change, but overloads a field name that `requirements.md`/
-     `techstack.md` tie specifically to job *processing*.
+## Three things to confirm before writing code
+
+**1. Installing Tesseract now.** `winget search tesseract` shows two real candidates:
+   - **`tesseract-ocr.tesseract` (v5.5.3, official upstream project)** — **Recommended**, this
+     is the actively-maintained upstream package.
+   - `UB-Mannheim.TesseractOCR` (v5.4.0, community Windows build) — the version most Windows
+     install guides point to; also fine, slightly older.
+
+   Either way I'd run `winget install <id>` and then confirm `tesseract --version` resolves in
+   a fresh shell (PATH changes need a new terminal). Tell me which one, or say "I'll install it
+   myself" and I'll pick back up once it's on PATH.
+
+**2. Native-vs-OCR routing threshold.** techstack.md says usable embedded text means "a
+reasonable fraction of pages... with recoverable structure," not an exact number. Per-page, I'm
+defining "has usable text" as ≥40 non-whitespace characters extracted by `pdfplumber` (a truly
+scanned/blank page yields ~0; even a sparse real page clears this easily). At the document
+level:
+   - **(a) All pages must pass, or the whole document goes to OCR.** **Recommended** — real
+     bank statements are essentially never a mix of native and scanned pages, and silently
+     dropping one page's transactions because only that page failed the native-text check is
+     exactly the kind of quiet inaccuracy this app is built to avoid (REQ-NORM-004/REQ-VAL-001
+     both lean on every page being accounted for).
+   - (b) ≥80% of pages must pass, rest OK to lose — closer to techstack.md's literal "reasonable
+     fraction" wording, but means a genuinely mixed document silently loses some pages' content
+     to whichever method runs.
 
    Going with **(a)** unless you say otherwise.
 
-## 1. Dependency
+**3. CI needs both binaries too.** `.github/workflows/ci.yml` runs on `ubuntu-latest` with
+neither Poppler nor Tesseract installed. Adding an `apt-get install -y poppler-utils
+tesseract-ocr` step so the OCR-path test actually runs in CI, not just locally. This isn't
+really optional — without it the new tests either fail in CI or have to be skipped there, which
+defeats having them.
 
-- [x] Add `pypdf` to `apps/backend/pyproject.toml` — lightweight, pure-Python, purpose-built
-      for reading PDF structure/metadata (`is_encrypted`, page count, raises on a corrupted
-      file) without pulling in the heavier `pdfplumber`/`pdfminer.six` extraction stack a step
-      early (that's step 4's dependency, for a different job: reading page *content*).
+## 1. Dependencies
 
-## 2. Schema change
+- [x] `pdfplumber` — native embedded-text extraction (already the plan's chosen library,
+      techstack.md §7; permissively licensed, unlike `PyMuPDF`)
+- [x] `pdf2image` — renders PDF pages to images for the OCR fallback (needs Poppler, already
+      present)
+- [x] `pytesseract` — OCR engine wrapper (needs the Tesseract binary, decision 1 above)
+- [x] `Pillow` as a **dev** dependency — used only in tests to build a synthetic "scanned"
+      (image-only, no text layer) PDF fixture; already an indirect dependency via `pdf2image`
+      but declaring it directly since tests import it by name
 
-- [x] `Batch`: add `validation_failed: int` column (decision 2a above)
-- [x] New model `IntakeFile` (`app/models/intake.py`): `id`, `batch_id` (FK),
-      `original_filename`, `status` (`ACCEPTED` / `UPLOAD_FAILED` / `VALIDATION_FAILED`),
-      `failure_reason` (nullable — the specific, actionable reason from REQ-INT-004), `temp_path`
-      (nullable, populated only when `ACCEPTED`), `page_count` (nullable), `created_at`
-- [x] Alembic migration for both changes
-- [x] Export `IntakeFile` from `app/models/__init__.py` alongside the existing models
+## 2. Extraction contract (REQ-EXT-003)
 
-## 3. Validation service
+- [x] `app/services/extraction.py` (matches `services/intake_validation.py`'s precedent —
+      "standalone service", not a new top-level package):
+      ```python
+      @dataclass(frozen=True)
+      class PageText:
+          page_number: int  # 1-indexed
+          text: str
 
-- [x] `app/services/intake_validation.py`: given raw bytes + filename, return a validation
-      result (accepted / rejected + specific reason). Checks, in order:
-      1. Extension/content sniff: reject non-PDF outright (REQ-INT-004)
-      2. Size check (25 MB default, see decision 1)
-      3. Open with `pypdf.PdfReader`: corrupted → reject with "corrupted PDF"; encrypted →
-         reject with "password-protected"
-      4. Page count check (300 default)
-- [x] Pure function, no FastAPI/DB imports, so it's directly unit-testable
+      @dataclass(frozen=True)
+      class ExtractionResult:
+          pages: list[PageText]
+          method: str  # "NATIVE" or "OCR"
 
-## 4. Temp storage
+      class ExtractionFailedError(Exception):
+          """REQ-EXT-004: OCR failed; never return partial/garbled text instead."""
 
-- [x] Accepted files get written to `apps/backend/data/tmp/<batch_id>/<intake_file_id>.pdf`
-      (same `data/` dir `db.py` already creates, matching techstack.md's "app's local
-      temp/user-data directory")
-- [x] Rejected/upload-failed files are never written to temp storage
+      def extract_text(pdf_path: Path) -> ExtractionResult: ...
+      ```
+- [x] `source_page` traceability (REQ-NORM-004, needed by build-plan #6's parsers) is why the
+      contract is per-page, not one flat string
 
-## 5. API endpoint
+## 3. Native-text detection and extraction
 
-- [x] `app/api/batches.py` (new `api/` package, per techstack.md's structure): `POST /batches`,
-      `multipart/form-data`, one or more files
-      - Create the `Batch` row first (REQ-INT-006: tracked from the moment files are selected)
-      - For each file: attempt to read its bytes (an `UPLOAD_FAILED` `IntakeFile` row if that
-        raises — e.g. an empty/unreadable part), else run it through the validation service
-        and record `ACCEPTED` or `VALIDATION_FAILED`
-      - One file's failure never stops the loop over the rest (REQ-INT-005)
-      - Update the `Batch` counts (`selected`, `uploaded`, `upload_failed`, `validation_failed`)
-        and set `status`: `PROCESSING` if at least one file was accepted, `FAILED` if none were
-        (there's no queue to hand accepted files to yet — that's step 5)
-      - Response: the batch id/counts plus one entry per file (`filename`, `status`,
-        `failure_reason`)
-- [x] Wire the router into `main.py`
+- [x] Open with `pdfplumber`, extract each page's text
+- [x] Per-page usable-text check: ≥40 non-whitespace characters (decision 2)
+- [x] All pages pass → return `ExtractionResult(pages=..., method="NATIVE")` immediately, skip
+      OCR entirely (REQ-EXT-002: native attempted first, OCR only as fallback)
 
-## 6. Tests
+## 4. OCR fallback
 
-- [x] Unit tests for `intake_validation.py`: non-PDF file, corrupted PDF, password-protected
-      PDF, oversized file, too-many-pages file, valid small PDF — generating tiny PDFs
-      on-the-fly with `pypdf`/`reportlab`-free stdlib-ish approach (or a minimal hand-built PDF
-      byte string) rather than committing binary fixtures for this step; real bank-statement
-      fixtures come in step 6 per `techstack.md`'s `tests/fixtures/statements/`
-- [x] API test for `POST /batches`: mixed batch (one valid, one corrupted, one
-      password-protected, one non-PDF) asserts per-file distinct statuses/reasons and correct
-      batch counts/status
-- [x] Keep the 90% coverage gate green (`uv run pytest`)
+- [x] Any page fails the native check → re-render the *whole document* via `pdf2image` and run
+      `pytesseract` on every page (decision 2a: don't mix methods within one document)
+- [x] `pytesseract`/`pdf2image` errors (`TesseractNotFoundError`, a corrupt render, etc.) are
+      caught and re-raised as `ExtractionFailedError` — REQ-EXT-004 requires a hard failure, not
+      partial or garbled text silently passed downstream
+
+## 5. Tests
+
+- [x] Native-path test: a `pypdf`-generated PDF with real embedded text (following build-plan
+      #3's precedent — synthetic, not a committed binary fixture) → asserts `method == "NATIVE"`
+      and correct per-page text
+- [x] OCR-path test: a synthetic "scanned" PDF — text drawn onto a blank image with Pillow
+      (`ImageDraw`), saved as an image-only PDF page (no text layer) — asserts `method == "OCR"`
+      and that the OCR'd text contains the known drawn string
+- [x] `ExtractionFailedError` test: simulate an OCR failure (e.g. monkeypatch `pytesseract` to
+      raise) and assert the error propagates rather than returning partial text
+- [x] Keep the 90% coverage gate green
+
+## 6. CI
+
+- [x] `.github/workflows/ci.yml`: add `apt-get install -y poppler-utils tesseract-ocr` before
+      the dependency-install step
 
 ## 7. Docs
 
-- [x] `docs/activity.md` entry for this task
-- [x] `README.md` status section if it still says "no intake endpoint yet"
+- [x] `docs/activity.md` entry
+- [x] `README.md` status section
 
 ## Review
 
-**What was completed:** the intake and validation flow from build-plan #3 / REQ-INT-001–006.
-`POST /batches` accepts one or more PDFs, creates a `Batch` row up front, validates each file
-independently against REQ-INT-003/004 (extension, size, corruption, password-protection, page
-count), writes accepted files to `data/tmp/<batch_id>/<intake_file_id>.pdf`, and persists a
-per-file `IntakeFile` row with a distinct `ACCEPTED`/`UPLOAD_FAILED`/`VALIDATION_FAILED` status
-and specific failure reason. Batch counters (`uploaded`, `upload_failed`, new
-`validation_failed`) update per file; one file's rejection never stops the rest (REQ-INT-005).
+**What was completed:** the extraction pipeline from build-plan #4 / REQ-EXT-001–004.
+`app/services/extraction.py` exposes `extract_text(pdf_path) -> ExtractionResult`: native text
+via `pdfplumber` first, whole-document OCR fallback via `pdf2image` + `pytesseract` when any
+page lacks usable embedded text, both converging on the same `ExtractionResult`
+(`pages: list[PageText]`, `method`) contract. Not wired into the job queue or bank detection —
+exactly as scoped.
 
-**Both open decisions confirmed by the user before implementation:** 25 MB / 300-page limits,
-and adding `Batch.validation_failed` as a new column (migration `a210b74a5423`) rather than
-overloading `processing_failed`.
+**All three confirmed decisions implemented as agreed:** Tesseract installed via
+`tesseract-ocr.tesseract` (winget, v5.5.3); all-pages-must-pass routing (one bad page sends the
+whole document to OCR, never a per-page split); CI now installs both `poppler-utils` and
+`tesseract-ocr` on the Ubuntu runner.
 
-**Found and fixed along the way:** `pypdf` reports `is_encrypted=True` for PDFs that are
-encrypted only to restrict printing/copying but have an empty user password — those open
-without a prompt and aren't "password-protected" in REQ-INT-003's sense. Fixed by only
-rejecting when `PdfReader.decrypt("")` returns `PasswordType.NOT_DECRYPTED` (a real user
-password is actually required). Covered by `test_owner_only_encryption_is_accepted`.
+**Deviation from the plan, found while implementing:** the plan's tests section assumed a
+`pypdf`-generated native-text fixture, but `pypdf` turned out to have no text-drawing API (it's
+built for manipulating existing PDFs, not authoring content from scratch). Rather than add a new
+dependency (e.g. `reportlab`) just for a test fixture, wrote a small hand-built PDF constructor
+(object graph + xref table) directly in the test file — no new dependency, and it doubles as the
+fixture for the mixed-document routing test (one real-text page + one blank page).
 
-**Also closed:** `main.py`/`/health` had 0% test coverage (a known gap flagged by the previous
-task). This task was already touching `main.py` to wire in the router, so added the trivial
-`test_main.py` rather than let the gap persist.
+**Also found:** the Tesseract winget package doesn't add itself to PATH (unlike some Windows
+installers). Added `C:\Program Files\Tesseract-OCR` to the user PATH environment variable
+directly so future terminals resolve `tesseract` without extra steps.
 
 **Tests/checks run:**
-- `uv run pytest` — 39 passed, 96% coverage (gate: 90%)
+- `uv run pytest` — 43 passed, 97% coverage (gate: 90%)
 - `uv run ruff check .` and `uv run ruff format --check .` — both clean
-- Manually confirmed accepted files land on disk and rejected files never get a `temp_path`
-  (asserted in `test_batches_api.py`)
+- OCR path verified against the real Tesseract binary, not mocked: recovered
+  "HELLO SCANNED STATEMENT" from a rendered image with no text layer
+- `ExtractionFailedError` path verified with a monkeypatched OCR failure — confirms the error
+  propagates rather than returning partial/garbled text (REQ-EXT-004)
 
 **Known issues / deliberate gaps:**
-- `IntakeFile.status == "UPLOAD_FAILED"` has no test. By the time a multipart request reaches
-  this endpoint, Starlette has already parsed it into `UploadFile` objects, so the failure mode
-  this branch guards against (`upload.read()` raising `OSError`) isn't realistically reachable
-  via `TestClient` without mocking internals — decided that's lower value than a real test.
-  Design-notes.md's "upload failed" state may in practice be a frontend-only concept (a local
-  file-read error in Electron before the request is even sent); worth revisiting once build-plan
-  #9 (frontend) exists and it's clear whether the backend ever actually produces this state.
-- No real bank-statement PDF fixtures yet — intentional, per build-plan #6 (`tests/fixtures/
-  statements/` is for the first real parser, not this step). This step's tests generate tiny
-  PDFs on the fly with `pypdf.PdfWriter`.
-- `db.py`'s pre-existing `get_session()` (unused before this task) still has no direct test —
-  not touched, out of scope for this task.
+- CI has not yet been observed to actually run green with the new `apt-get install` step (that
+  only happens once this branch's PR opens and the `backend` check runs) — the step mirrors the
+  same packages verified locally, but flagging it as unconfirmed-in-CI until the PR's check
+  actually passes.
+- No real bank-statement PDF fixtures — intentional, same reasoning as build-plan #3: real
+  fixtures belong to build-plan #6 (first parser), this step only needed to prove the
+  native/OCR contract works, not validate against actual statement layouts.
+- The 40-character per-page "usable text" floor and the all-pages-must-pass routing rule are
+  both judgment calls (techstack.md gives no exact numbers) — revisit if build-plan #6 turns up
+  a real statement that's borderline (e.g. a mostly-native statement with one oddly-formatted
+  page that trips the floor unnecessarily).
 
-**Recommended next step:** build-plan.md #4 — extraction pipeline (native text via `pdfplumber`,
-OCR fallback via `pdf2image`/`pytesseract`).
+**Recommended next step:** build-plan.md #5 — background job queue (`statement_jobs` table,
+worker pool, retry logic, `BatchCoordinator`), which is what will actually call
+`extract_text()` and `validate_pdf()` against queued `IntakeFile` rows.

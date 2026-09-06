@@ -14,10 +14,12 @@ keys) backed by a 90%+ test coverage requirement (see [Testing](#testing) below)
 
 `POST /batches` accepts one or more PDF uploads, validates each independently (rejects non-PDF,
 corrupted, password-protected, oversized, or too-many-page files with a specific reason), and
-tracks every file's status (`IntakeFile`) from the moment it's submitted. No extraction, parsers,
-job queue, or analytics yet.
+tracks every file's status (`IntakeFile`) from the moment it's submitted. A standalone extraction
+service pulls page text out of an accepted PDF — native text via `pdfplumber` first, OCR via
+`pdf2image`/`pytesseract` as a fallback when a page has no usable embedded text — converging on
+one contract either way. No bank detection, parsers, job queue, or analytics yet.
 
-Next up is the extraction pipeline (`build-plan.md` #4). Progress is logged in
+Next up is the background job queue (`build-plan.md` #5). Progress is logged in
 [`docs/activity.md`](./docs/activity.md), and written up for humans as a build log at
 [kervintznoel.com/posts](https://kervintznoel.com/posts/build-log-1-a-window-that-says-ok).
 
