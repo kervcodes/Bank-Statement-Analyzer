@@ -189,6 +189,65 @@ def test_categorize_statement_respects_an_existing_user_override(session: Sessio
     assert t.predicted_category is None
 
 
+def test_llm_fills_a_merchant_the_rules_could_not_place(session: Session, monkeypatch):
+    import app.services.categorization as cat
+    from app.llm.base import CategorySuggestion
+
+    calls: list = []
+
+    def fake_suggest(**kwargs):
+        calls.append(kwargs)
+        return CategorySuggestion("Personal Care", 0.91)
+
+    monkeypatch.setattr(cat, "suggest_category", fake_suggest)
+
+    s = _statement(session)
+    _txn(session, s, desc="ZZQ SPA RETREAT 44")
+    _txn(session, s, desc="ZZQ SPA RETREAT 91")  # same merchant -> one LLM call
+
+    categorize_statement(session, s)
+
+    assert len(calls) == 1  # one call per unique merchant
+    rows = list(
+        session.exec(select(Transaction).where(col(Transaction.statement_id) == s.id))
+    )
+    for t in rows:
+        assert t.predicted_source == "LLM"
+        assert t.predicted_category == "Personal Care"
+        assert t.category == "Personal Care"
+        assert t.category_source == "LLM"
+
+
+def test_low_confidence_llm_suggestion_goes_to_review(session: Session, monkeypatch):
+    import app.services.categorization as cat
+    from app.llm.base import CategorySuggestion
+
+    monkeypatch.setattr(
+        cat, "suggest_category", lambda **k: CategorySuggestion("Shopping", 0.40)
+    )
+    s = _statement(session)
+    t = _txn(session, s, desc="ZZQ MYSTERY VENDOR")
+
+    categorize_statement(session, s)
+
+    session.refresh(t)
+    assert t.category == "Uncategorized"
+    assert t.category_source == "NONE"
+    assert t.predicted_category == "Shopping"  # kept, not discarded
+
+
+def test_no_provider_leaves_categorization_deterministic(session: Session):
+    # suggest_category returns None with no env keys -> identical to Part 1
+    s = _statement(session)
+    _txn(session, s, desc="ZZQ MYSTERY VENDOR")
+    categorize_statement(session, s)
+    (t,) = session.exec(
+        select(Transaction).where(col(Transaction.statement_id) == s.id)
+    )
+    assert t.category == "Uncategorized"
+    assert t.predicted_source == "NONE"
+
+
 def test_deleting_a_merchant_rule_restores_the_prediction(session: Session):
     s = _statement(session)
     t = _txn(session, s, desc="AMAZON.COM CARD PURCHASE")

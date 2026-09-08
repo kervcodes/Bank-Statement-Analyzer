@@ -84,46 +84,74 @@ using adversarial examples.
       `LLMUnavailable`; Anthropic skips a leading thinking block; `configured_providers()`
       ordering for each `LLM_PROVIDER` and with keys missing. **205 passed, 97%.**
 
-### P2-3. The single gateway — `app/services/llm_gateway.py`
-- [ ] `suggest_category(*, merchant, description_normalized, amount_cents, direction) ->
-      CategorySuggestion | None` — build payload via `privacy_gateway`, then try each provider
-      in order: return the first **successful** result; on `LLMUnavailable` move to the next
-      (decision 2); a *successful low-confidence* result is returned as-is, **not** retried on
-      the fallback (decision 3). No providers / all failed → `None`.
-- [ ] `explain_analytics(analytics) -> ExplanationResult` — `{provider: str | None, model: str
-      | None, text: str | None}`. Same provider-failure fallback; no provider → all `None`.
-- [ ] `tests/test_llm_gateway.py`:
-      - **The build-plan leak test** — a transaction whose `description_normalized` carries a
-        full account number and a person's name; run through `suggest_category` with a fake
-        provider that records the payload; assert the recorded payload contains **neither** the
-        account number nor the name, and no `description_raw`.
-      - Fallback on primary `LLMUnavailable`; **no** fallback when the primary returns a
-        low-confidence suggestion.
-      - Import-boundary test: nothing outside `app/llm/` and `app/services/llm_gateway.py`
-        imports `app.llm.*` (walk the source tree).
+### P2-3. The single gateway — `app/services/llm_gateway.py`  ✅
+- [x] `suggest_category(...)` — build payload via `privacy_gateway` (a
+      `PrivacyBlockedError` → `None`, no provider called); try each provider in order; on
+      `LLMUnavailable` move to the next; **any answer** (a suggestion, a low-confidence
+      suggestion, or `None`) ends the walk — the fallback is never used for a weak/absent
+      answer, only for a failure.
+- [x] `explain_analytics(analytics) -> Explanation` (`provider` / `model` / `text`, all `None`
+      with no provider or all failed).
+- [x] `tests/test_llm_gateway.py` (13) — **the leak test**: a description with an account
+      number, a name, a phone and an email → the recorded provider payload contains none of
+      them and exactly the four allowlisted keys. Fallback on `LLMUnavailable`; **no** fallback
+      on a low-confidence answer or a `None`. Privacy-blocked → no provider call. Import-boundary
+      walk: only `llm_gateway.py` imports `app.llm.*`.
 
-### P2-4. Wire the LLM into categorization + a new endpoint
-- [ ] `categorization.py`: replace the `_llm_prediction` stub. `categorize_statement` gains a
-      second phase — collect the **unique** `(merchant, direction)` of transactions whose
-      deterministic `predicted_source == "NONE"` and `user_category is None`; call
-      `llm_gateway.suggest_category` **once per unique merchant**; a valid suggestion sets
-      `predicted_category` / `predicted_confidence` / `predicted_source = "LLM"` on every
-      matching transaction; then `resolve_category` as before (the 0.75 gate is unchanged).
-      `predict_category` stays deterministic-only and its tests unchanged.
-- [ ] `app/api/analytics.py`: `GET /analytics/explanation?start=&end=` → `build_analytics` →
-      `llm_gateway.explain_analytics` → `{provider, model, text}` (all `None` when no key).
-- [ ] Tests: `test_categorization.py` — a fake provider fills a `NONE` prediction as `LLM`
-      above threshold → assigned; a low-confidence LLM suggestion → `Uncategorized` / Review;
-      the no-provider path is unchanged from Part 1. `test_analytics_explanation.py` — endpoint
-      with a fake provider and with none (200 + nulls, never 500).
+### P2-4. Wire the LLM into categorization + a new endpoint  ✅
+- [x] `categorization.py`: `_llm_prediction` stub removed; `predict_category` is now
+      deterministic-only. `categorize_statement` runs `_llm_fill` between the rule pass and
+      `resolve_category` — one `suggest_category` call per unique `(merchant, direction)` whose
+      deterministic `predicted_source == "NONE"`, setting `predicted_source = "LLM"` on the
+      group. The 0.75 gate in `resolve_category` is untouched, so a weak LLM answer → Review
+      with the prediction retained. No provider → `suggest_category` returns `None` → identical
+      to Part 1.
+- [x] `app/api/analytics.py`: `GET /analytics/explanation?start=&end=` → `{provider, model,
+      text}`, all `null` with no key.
+- [x] Tests: `test_categorization.py` — LLM fills a `NONE` merchant (one call for two rows);
+      low-confidence LLM → `Uncategorized`/`NONE`, `predicted_category` kept; no-provider path
+      unchanged. `test_analytics.py` — the explanation endpoint with a fake provider and with
+      none.
 
-### P2-5. Checks & docs
-- [ ] `uv run pytest` (≥ 90), `ruff check`, `ruff format --check`. No real network in the suite.
-- [ ] `docs/activity.md`; `README.md` Status / Next up (→ #9); extend
-      `docs/manual-verification-categorization.md` with the sanitizer + provider + "works with
-      no key" checks (or a new `manual-verification-llm.md`).
-- [ ] `tasks/todo.md` Review section.
+### P2-5. Checks & docs  ✅
+- [x] `uv run pytest` (221 passed, 97%), `ruff check`, `ruff format --check`. No real network.
+- [x] `docs/activity.md`; `README.md` Status / Next up (→ #9); `docs/manual-verification-llm.md`.
+- [x] `tasks/todo.md` Review section (below).
 
 ## Review
 
-_(filled in when Part 2 is done)_
+### Part 2 — Privacy Gateway + LLM layer (this PR)
+
+**Completed:** `app/services/privacy_gateway.py` (allowlist payload types + `sanitize_text` +
+fail-closed), `app/llm/` (`LLMProvider` protocol, `NullProvider`, `OpenAIProvider` /
+`AnthropicProvider` on raw `httpx`, `configured_providers()`), `app/services/llm_gateway.py`
+(the single chokepoint + fallback rule), the LLM phase in `categorize_statement`, and
+`GET /analytics/explanation`. `httpx` promoted to a runtime dep. Branch
+`feature/privacy-llm-gateway` off `main` (Part 1 = PR #13 merged).
+
+**Locked decisions honoured:** OpenAI primary (`gpt-5.6-luna`), Anthropic fallback
+(`claude-sonnet-5`); fallback **only** on `LLMUnavailable` (timeout / rate limit / HTTP / API /
+parse error), never on low confidence — a weak answer goes to Review like any sub-0.75
+prediction; provider and model are separate env vars; the outbound payload is a 4-field
+allowlist model built from primitives (never a serialized `Transaction`); merchant
+normalization stays local and pre-network; all Part 1 invariants preserved.
+
+**Deviation:** raw `httpx` for both provider clients rather than the `anthropic` SDK the
+`claude-api` skill recommends. Rationale: the codebase has no SDKs anywhere, keeps a small
+dependency surface (same ethos as "no pandas"), the calls are single JSON POSTs, and one
+transport gives uniform `MockTransport` testing. Contained behind `LLMProvider` — an SDK swap
+later touches one file.
+
+**Tests:** `uv run pytest` — **_TBD_ passed, _TBD_% coverage** (gate 90). No real network
+(every provider test uses `httpx.MockTransport`). New: `test_privacy_gateway.py` (24),
+`test_llm_providers.py` (18), `test_llm_gateway.py` (13, incl. the build-plan leak test and
+the import-boundary walk), plus `test_categorization.py` / `test_analytics.py` additions.
+
+**Known / follow-ups:**
+- Live-server E2E with a real key not run. `docs/manual-verification-llm.md` is the runbook.
+- `gpt-5.6-luna` API shape assumed to be chat-completions; `anthropic-version: 2023-06-01`.
+  Confirm against a real call when a key is available.
+- Electron `safeStorage` + the Settings screen (real key handling) are build-plan #9; Part 2
+  reads env vars only.
+- Confidence calibration (the 0.75 gate, the rule confidences, and now the LLM's self-reported
+  confidence) still needs a labelled pass over the 12 real statements.
