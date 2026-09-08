@@ -50,14 +50,24 @@ in integer cents, ratios as fixed-precision strings.
 Each transaction is then given a normalized merchant ("UBER *TRIP 8AF3" and "UBER TECHNOLOGIES"
 both become "Uber") and a category, resolved through a fixed, non-destructive hierarchy: a
 per-transaction user override, then a saved merchant rule, then the deterministic prediction
-(a built-in merchant/keyword map) — and only if that clears a 0.75 confidence gate, otherwise
-the transaction goes to the Review queue rather than being labelled on a weak guess. The
-automated guess is stored separately and never discarded, so removing a rule restores it with
-no bulk rewrite. Every category carries an income / expense / transfer type, so a transfer
-between your own accounts never counts as spending. `PUT /transactions/{id}/category` records a
-single correction; `PUT /category-rules` makes it merchant-wide. LLM-assisted categorization
-for the merchants the rules miss, plus a plain-English dashboard summary — both behind a
-Privacy Gateway that strips PII first — are `build-plan.md` #8 part 2. Progress is logged in
+(a built-in merchant/keyword map), then — only for merchants the rules can't place — one LLM
+classification. A prediction is used only if it clears a 0.75 confidence gate; otherwise the
+transaction goes to the Review queue rather than being labelled on a weak guess. The automated
+guess is stored separately and never discarded, so removing a rule restores it with no bulk
+rewrite. Every category carries an income / expense / transfer type, so a transfer between your
+own accounts never counts as spending. `PUT /transactions/{id}/category` records a single
+correction; `PUT /category-rules` makes it merchant-wide.
+
+Anything sent to an LLM — the merchant classification above, and the optional plain-English
+dashboard summary at `GET /analytics/explanation` — goes through one Privacy Gateway that is
+the only place an outbound payload is built. It is an allowlist, not a scrub: exactly four
+fields (`merchant`, `description`, `amount`, `direction`) leave the machine, built from
+primitives so a raw transaction object can never be serialized by accident, with the
+description locally sanitized (account/card/routing numbers, SSNs, emails, phone numbers,
+transfer-recipient names) and a fail-closed check that routes a transaction to Review rather
+than send anything it can't vouch for. The provider is configurable (OpenAI primary, Anthropic
+fallback on provider failure only); with no API key the app is byte-identical to its
+deterministic self. Next: `build-plan.md` #9 — the frontend screens. Progress is logged in
 [`docs/activity.md`](./docs/activity.md), and written up for humans as a build log at
 [kervintznoel.com/posts](https://kervintznoel.com/posts/build-log-1-a-window-that-says-ok).
 
@@ -129,7 +139,7 @@ pnpm dev
 ```
 
 To continue building, run the prompts in [`build-plan.md`](./build-plan.md) in order, starting
-from #8 — they're sequenced so each one builds on a working, tested version of the last.
+from #9 — they're sequenced so each one builds on a working, tested version of the last.
 
 ## Testing
 

@@ -9,10 +9,13 @@ The prediction (`predicted_*`) is stored separately from the effective `category
 and is never discarded, so removing a user override or a merchant rule restores
 it with no bulk row rewrite (REQ-CAT-004).
 
-Deterministic only here; the LLM fallback slots in at `_llm_prediction` in
-build-plan #8 part 2.
+`predict_category` is deterministic-only. The LLM step runs in
+`categorize_statement` as a separate phase over the transactions the rules left
+`NONE` -- one call per unique merchant, always through `llm_gateway` (never a
+provider client directly), and still subject to the 0.75 gate.
 """
 
+from collections import defaultdict
 from dataclasses import dataclass
 
 from sqlmodel import Session, col, select
@@ -25,6 +28,7 @@ from app.services.categorization_rules import (
     KEYWORD_CATEGORY,
     MERCHANT_CATEGORY,
 )
+from app.services.llm_gateway import suggest_category
 from app.services.merchant_normalization import normalize_merchant
 
 # The gate between "assign automatically" and "send to Review". Deliberately
@@ -44,19 +48,12 @@ class Prediction:
 NO_PREDICTION = Prediction(category=None, confidence=0.0, source="NONE")
 
 
-def _llm_prediction(
-    merchant: str, description_normalized: str, direction: str
-) -> Prediction | None:
-    """LLM-assisted classification. Wired in build-plan #8 part 2 (behind the
-    Privacy Gateway); until then there is no provider and this is skipped."""
-    return None
-
-
 def predict_category(
     merchant: str, description_normalized: str, direction: str
 ) -> Prediction:
-    """The automated guess for one transaction — deterministic rules first, then
-    (part 2) the LLM, then a direction-based default for credits."""
+    """The deterministic automated guess for one transaction — exact merchant
+    mapping, then keyword rules, then a direction-based default for credits.
+    No network; the LLM step is a separate phase in `categorize_statement`."""
     exact = MERCHANT_CATEGORY.get(merchant)
     if exact is not None:
         return Prediction(exact, CONFIDENCE_MERCHANT, "RULE")
@@ -65,10 +62,6 @@ def predict_category(
     for keyword, category in KEYWORD_CATEGORY:
         if keyword in haystack:
             return Prediction(category, CONFIDENCE_KEYWORD, "RULE")
-
-    llm = _llm_prediction(merchant, description_normalized, direction)
-    if llm is not None:
-        return llm
 
     if direction == "CREDIT":
         # A credit with no merchant or keyword signal is almost always income
@@ -105,14 +98,47 @@ def _rule_lookup(session: Session) -> dict[str, str]:
     return {r.merchant: r.category for r in session.exec(select(CategoryRule)).all()}
 
 
+def _llm_fill(txns: list[Transaction]) -> None:
+    """For transactions the deterministic rules left unplaced, ask the LLM once
+    per unique merchant (through the gateway, which sanitizes first). A usable
+    suggestion becomes the `LLM` prediction -- still gated at 0.75 in
+    `resolve_category`. With no provider configured, `suggest_category` returns
+    ``None`` for every call and nothing changes."""
+    groups: dict[tuple[str, str], list[Transaction]] = defaultdict(list)
+    for txn in txns:
+        if (
+            txn.user_category is None
+            and txn.predicted_source == "NONE"
+            and txn.merchant_normalized
+        ):
+            groups[(txn.merchant_normalized, txn.direction)].append(txn)
+
+    for (merchant, direction), group in groups.items():
+        sample = group[0]
+        suggestion = suggest_category(
+            merchant_normalized=merchant,
+            description_normalized=sample.description_normalized,
+            amount_cents=sample.amount_cents,
+            direction=direction,
+        )
+        if suggestion is None:
+            continue
+        for txn in group:
+            txn.predicted_category = suggestion.category
+            txn.predicted_confidence = suggestion.confidence
+            txn.predicted_source = "LLM"
+
+
 def categorize_statement(session: Session, statement: Statement) -> None:
-    """The pipeline pass: normalize the merchant, predict, and resolve for every
-    transaction on the statement. Idempotent; leaves a `USER`-set transaction's
-    prediction untouched."""
+    """The pipeline pass: normalize the merchant, predict (rules then LLM), and
+    resolve for every transaction on the statement. Idempotent; leaves a
+    `USER`-set transaction's prediction untouched."""
     rules = _rule_lookup(session)
-    txns = session.exec(
-        select(Transaction).where(col(Transaction.statement_id) == statement.id)
-    ).all()
+    txns = list(
+        session.exec(
+            select(Transaction).where(col(Transaction.statement_id) == statement.id)
+        )
+    )
     for txn in txns:
         txn.merchant_normalized = normalize_merchant(txn.description_normalized)
         if txn.user_category is None:
@@ -122,6 +148,10 @@ def categorize_statement(session: Session, statement: Statement) -> None:
             txn.predicted_category = prediction.category
             txn.predicted_confidence = prediction.confidence
             txn.predicted_source = prediction.source
+
+    _llm_fill(txns)
+
+    for txn in txns:
         resolve_category(txn, merchant_rule_category=rules.get(txn.merchant_normalized))
         session.add(txn)
     session.commit()

@@ -307,6 +307,34 @@ def test_get_analytics_rejects_a_bad_date(client: TestClient):
     assert client.get("/analytics?start=not-a-date").status_code == 422
 
 
+def test_explanation_endpoint_without_a_provider(client: TestClient, session: Session):
+    _seed_small_ledger(session)
+    body = client.get("/analytics/explanation").json()
+    assert body == {"provider": None, "model": None, "text": None}
+
+
+def test_explanation_endpoint_with_a_provider(
+    client: TestClient, session: Session, monkeypatch
+):
+    import app.api.analytics as analytics_api
+    from app.services.llm_gateway import Explanation
+
+    monkeypatch.setattr(
+        analytics_api,
+        "explain_analytics",
+        lambda a: Explanation(
+            provider="openai", model="gpt-5.6-luna", text="All steady."
+        ),
+    )
+    _seed_small_ledger(session)
+    body = client.get("/analytics/explanation").json()
+    assert body == {
+        "provider": "openai",
+        "model": "gpt-5.6-luna",
+        "text": "All steady.",
+    }
+
+
 def _seed_statement(session: Session, *, batch_id: str, created: datetime) -> Statement:
     if session.get(Account, "a1") is None:
         session.add(

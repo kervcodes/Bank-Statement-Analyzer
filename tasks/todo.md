@@ -1,259 +1,157 @@
-# Todo: Build-plan #8 — Categorization, Privacy Gateway, and the LLM layer
+# Todo: Build-plan #8 Part 2 — Privacy Gateway + LLM layer
 
-Source: `build-plan.md` §8 → `requirements.md` §11 (REQ-CAT-001..004), §12 (REQ-LLM-001..003,
-101..103, 201), `techstack.md` §11–§12, `design-notes.md` §3.4 / §3.7.
+Branch `feature/privacy-llm-gateway` off `feature/categorization-privacy-llm` (Part 1, PR #13).
+Rebase onto `main` once #13 merges. Source: `build-plan.md` §8, `requirements.md` §12
+(REQ-LLM-001..003, 101..103, 201), `techstack.md` §11–§12.
+
+> **Load the `claude-api` skill before writing the Anthropic client.**
 
 ## Goal
 
-1. Every transaction gets a **normalized merchant** and a **category** resolved through a fixed
-   hierarchy — user override → merchant rule → deterministic rules → LLM classifier → Review.
-   Nothing modifies financial data on a weak guess.
-2. A **Privacy Gateway** is the one chokepoint for anything sent to an LLM; no other module
-   calls a provider client (REQ-LLM-001). It redacts PII and never sends `description_raw`.
-3. A **provider abstraction** (Claude + OpenAI), provider and model configured **separately**.
-   The app is fully functional with no key (REQ-LLM-102).
+1. A **Privacy Gateway** (`app/services/privacy_gateway.py`) is the *only* place a payload is
+   built for an LLM and the *only* place PII is stripped. No other module imports a provider
+   client (REQ-LLM-001).
+2. A **provider abstraction** (`app/llm/`) with an OpenAI and an Anthropic client, **provider
+   and model configured separately** by env var. The app is byte-identical to Part 1 when no
+   key is set (REQ-LLM-102).
+3. **LLM-assisted categorization** fills the gap the deterministic rules leave: a merchant the
+   rules don't know gets one LLM classification, still subject to the 0.75 gate.
+4. **`GET /analytics/explanation`** — a plain-English summary of the analytics payload, clearly
+   labelled with its provider (REQ-LLM-201). Never the source of a number.
 
-## LOCKED decisions (from the owner, this session)
+## LOCKED decisions (owner, this session)
 
-| # | Decision | Lock |
-|---|----------|------|
-| 1 | Auto-assign threshold | **0.75** to start; a named constant, to be calibrated against labelled real transactions. Optimize **precision on auto-assigned**, not Review-avoidance. |
-| 2 | Categories | **Fixed controlled taxonomy** (below). The LLM may never invent a category. |
-| 3 | Every category has a **transaction type**: `income` / `expense` / `transfer`. Transfers and income never count as spending. |
-| 4 | Category is **layered, non-destructive**: store `predicted_category` + `predicted_confidence` + `predicted_source`, `user_category` (per-txn), and a merchant rule (`CategoryRule`). Effective `category` is resolved from those. |
-| 5 | A plain category edit is **transaction-only**. A **merchant-wide** rule is a separate explicit action ("always categorize [merchant] as X"). |
-| 6 | **No bulk destructive overwrite.** Deleting a merchant rule restores the prediction — no Undo feature needed in v1. |
-| 7 | Resolution order (invariant): `USER OVERRIDE → MERCHANT RULE → DETERMINISTIC RULES → LLM → (conf ≥ 0.75 ? assign : Review)` |
-| 8 | Anthropic model | `claude-sonnet-5` |
-| 9 | OpenAI model | `gpt-5.6-luna` to start |
-| 10 | Model config | `LLM_PROVIDER` + `ANTHROPIC_MODEL` / `OPENAI_MODEL` — **provider and model never coupled in code** |
-| 11 | Dev secrets | `.env`, backend/main-process only, renderer never sees a key. `safeStorage` is build-plan #9. |
-| 12 | LLM payload | redacted, minimal transaction fields only (`{merchant, description, amount, direction}`) — never PDFs, account numbers, names, addresses. |
+| # | Decision |
+|---|----------|
+| 1 | **OpenAI is primary**: `OPENAI_MODEL=gpt-5.6-luna`. Fallback: `ANTHROPIC_MODEL=claude-sonnet-5`. |
+| 2 | Fallback fires **only on provider failure** — timeout, rate limit, HTTP/API error, unparseable response. |
+| 3 | **Never** call the fallback because the primary returned low confidence. A low-confidence LLM result → Review, exactly like any sub-0.75 prediction. |
+| 4 | Provider and model are separate env vars: `LLM_PROVIDER` (`openai`\|`anthropic`, default `openai`), `OPENAI_MODEL`, `ANTHROPIC_MODEL`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`. |
+| 5 | The payload to a provider is the **minimum redacted fields for classification** — `{merchant, description, amount, direction}`-shaped. Never raw statements, `description_raw`, names, account/routing numbers, addresses, phone, email. |
+| 6 | Dev secrets: `.env`, backend process only. `safeStorage` + the Settings screen are build-plan #9 — Part 2 reads env vars and notes the handoff. |
 
-### v1 taxonomy (central module — `app/models/taxonomy.py`)
+## Part 1 invariants to PRESERVE (do not redesign unless Part 2 exposes a real bug)
 
-```
-income    : Income
-transfer  : Transfers, Credit Card Payments
-expense   : Housing, Utilities, Groceries, Dining, Transportation, Fuel, Shopping,
-            Entertainment, Subscriptions, Healthcare, Insurance, Education, Travel,
-            Personal Care, Fees & Interest, Cash & ATM, Taxes, Debt Payments
-(special) : Uncategorized
-```
-
-`Uncategorized` has no transaction type. **Spending** = debits whose category type is
-`expense` **or** is `Uncategorized` (an un-triaged debit is more honestly counted as spend than
-hidden). Income and transfer categories are never spending.
-
-## Split into two PRs (like #7)
-
-- **Part 1 — merchant normalization + deterministic categorization + the layered resolution +
-  Review lane.** No network, no new dependency. Stands alone (REQ-LLM-102).
-- **Part 2 — Privacy Gateway + `LLMProvider` (Claude/OpenAI) + LLM-assisted classification +
-  dashboard explanation.** Adds `httpx` as a runtime dep. Includes the build-plan leak test.
-
-## State of the repo
-
-- Branch `feature/categorization-privacy-llm` off `feature/analytics-engine` (PR #12, **not yet
-  merged** — stacked; #12 merges first).
-- `Transaction.category` exists (always `None`). `description_normalized` = parser whitespace
-  cleanup only. Pipeline: `processor.process_job` → extract/detect/parse/`normalize`/
-  `validate_statement`/`mark_completed`, then `run_dedup_for_batch` on batch completion.
-- Analytics (Part B base): `spending_by_category` groups on `category`; `merchant_totals` /
-  `recurring_charges` on `description_normalized`.
-- Money is integer cents. `httpx` is dev-only today.
-
-## The layered model (Part 1)
-
-`Transaction` gains:
-- `merchant_normalized: str | None` (indexed)
-- `predicted_category: str | None` — deterministic-rule or (Part 2) LLM output
-- `predicted_confidence: float | None`
-- `predicted_source: str | None` — CHECK `RULE` / `LLM` / `NONE`
-- `user_category: str | None` — CHECK in `CATEGORIES`; a per-transaction override
-- `category: str` (default `"Uncategorized"`) — **materialized effective category**, CHECK in
-  `CATEGORIES`
-- `category_source: str` (default `"NONE"`) — CHECK `USER` / `MERCHANT_RULE` / `RULE` / `LLM` /
-  `NONE`; how `category` was decided (drives the Review lane)
-
-New `CategoryRule`: `id`, `merchant` (unique, indexed), `category` (CHECK in `CATEGORIES`),
-`created_at`. Only ever user-created.
-
-`resolve_category(session, txn)` (the invariant, decision 7):
-1. `txn.user_category` set → `category` = it, `category_source = "USER"`.
-2. else a `CategoryRule` for `txn.merchant_normalized` → `category` = rule.category,
-   `category_source = "MERCHANT_RULE"`.
-3. else `predicted_confidence >= THRESHOLD` → `category` = `predicted_category`,
-   `category_source = predicted_source`.
-4. else → `category = "Uncategorized"`, `category_source = "NONE"` → shows in Review.
-
-Recompute points: the categorize pass on a new statement; `PUT /transactions/{id}/category`;
-`POST` / `DELETE` of a `CategoryRule`.
+- Resolution order: `USER OVERRIDE → MERCHANT RULE → prediction ≥ 0.75 → Review`.
+- `predicted_*` stays separate from `user_category`; predictions are never discarded.
+- Merchant rules are non-destructive (delete restores the prediction).
+- Transfers and income never count as spending; `Uncategorized` debits do.
+- Merchant normalization runs **locally, before** anything crosses the network.
 
 ## Tasks
 
-### Part 1 — Merchant normalization + deterministic categorization
+### P2-1. Privacy Gateway — `app/services/privacy_gateway.py`  (pure, no network)  ✅
+Locked (owner): allowlist type not scrub; never serialize a `Transaction`; `merchant` from
+`merchant_normalized`; sanitize `description` before construction; **fail closed** →
+`PrivacyBlockedError` → no LLM → Review; no raw content ever an LLM arg; no logging of raw/
+pre-sanitized content; tests prove the serialized payload has no forbidden fields / seeded PII
+using adversarial examples.
+- [x] `OutboundTransaction` — a frozen, `extra="forbid"` Pydantic model with exactly
+      `merchant` / `description` / `amount` / `direction`. `OutboundAnalytics` similarly for
+      the explanation path (aggregates only — no statement ids, bank names, or account ids).
+- [x] `sanitize_text` — SSN, email, spaced-card (13–19), phone, digit-run ≥ 7, a P2P line
+      (`ZELLE|VENMO|CASHAPP|PAYPAL|…` → whole tail dropped), `TRANSFER/WIRE/PYMT/… TO|FROM
+      <Name>` name tail.
+- [x] `build_categorization_payload(*, merchant_normalized, description_normalized,
+      amount_cents, direction)` — four primitives in, `OutboundTransaction` out. Raises
+      `PrivacyBlockedError` on a bad direction, a non-int amount, a residual-PII scan hit
+      (defense in depth), or nothing left to classify.
+- [x] `build_explanation_payload(analytics)` — `OutboundAnalytics`; every merchant through
+      `sanitize_text`; ids/bank/account dropped.
+- [x] `tests/test_privacy_gateway.py` (23) — adversarial `ZELLE TO JOHN DOE`, card/account/
+      routing numbers, phone, email, SSN, names in transfer descriptions all gone from the
+      **serialized** payload; ordinary merchants survive; every fail-closed path; the
+      allowlist rejects an extra field. **188 passed, privacy_gateway.py 100% coverage.**
 
-#### P1-1. Taxonomy + model + migration  ✅
-- [x] `app/models/taxonomy.py` — `CATEGORIES` (22, ordered), `CATEGORY_TYPE`, `TRANSACTION_TYPES`,
-      `category_type`, `is_spending_category`, `category_in_sql`. Re-exported from
-      `app/models/__init__.py`.
-- [x] `Transaction`: `merchant_normalized` (idx), `predicted_category`, `predicted_confidence`,
-      `predicted_source`, `user_category`, `category` (now NOT NULL, default `Uncategorized`),
-      `category_source` + 5 CHECKs. `CategoryRule` in `app/models/categorization.py`;
-      `CATEGORY_SOURCES` / `PREDICTED_SOURCES` in `canonical.py`.
-- [x] Migration `208f30aad50f` — hand-written `batch_alter_table` (backfills NULL `category`
-      first, PRAGMA FK off around the rebuild). Verified: fresh up/down/up, and a seeded db
-      (2 txns preserved, `category` → `Uncategorized`, integrity + FK checks clean, CHECK fires).
+### P2-2. Provider abstraction — `app/llm/`  ✅
+- [x] `base.py` — `LLMProvider` Protocol (`categorize` / `explain`), `CategorySuggestion`,
+      `LLMUnavailable`, and `parse_category_suggestion` (fence-strips, finds the first `{…}`,
+      validates the category ∈ `CATEGORIES`, clamps confidence). **`None` = answered-but-unusable
+      (→ Review, no fallback); `LLMUnavailable` = failed (→ fallback).**
+- [x] `null.py` — `NullProvider`, both methods `None`.
+- [x] `openai_provider.py` / `anthropic_provider.py` — raw `httpx` (deviation from the
+      `claude-api` skill's SDK recommendation — noted in `docs/activity.md`; rationale: the
+      codebase has no SDKs, keeps its dep surface small, and one transport = uniform
+      `MockTransport` testing). Injectable `client` for tests. Any HTTP/parse error →
+      `LLMUnavailable`. Anthropic: parses the first `text` block (thinking-block safe);
+      `categorize` disables thinking, `explain` leaves it adaptive.
+- [x] `providers.py` — `configured_providers()`: `LLM_PROVIDER` (default `openai`) picks the
+      order; each provider included only if its key is present; `[]` when neither.
+- [x] `uv add httpx` (promoted to runtime; removed the dev duplicate). `.env.example` created
+      with `LLM_PROVIDER` / `OPENAI_*` / `ANTHROPIC_*`.
+- [x] `tests/test_llm_providers.py` (18) — all `app/llm/` files at 100%. Good reply parsed;
+      unknown category / malformed → `None`; fenced JSON parsed; 500 / timeout / 429 →
+      `LLMUnavailable`; Anthropic skips a leading thinking block; `configured_providers()`
+      ordering for each `LLM_PROVIDER` and with keys missing. **205 passed, 97%.**
 
-#### P1-2. Merchant normalization — `app/services/merchant_normalization.py`
-- [x] `normalize_merchant(description_normalized) -> str` — pure. Uppercase; strip processor
-      prefixes (`SQ *`, `TST* `, `PP*`, `PAYPAL *`, `POS `, `ACH `, `DEBIT CARD PURCHASE`),
-      trailing store #s / city+state / dates / ref numbers; map via `MERCHANT_ALIASES`.
-- [x] `tests/test_merchant_normalization.py` — `"UBER *TRIP …"` & `"UBER TECHNOLOGIES"` →
-      `"Uber"` (REQ-CAT-002); real-shaped Santander descriptions; unknown merchant → cleaned
-      but recognizable.
+### P2-3. The single gateway — `app/services/llm_gateway.py`  ✅
+- [x] `suggest_category(...)` — build payload via `privacy_gateway` (a
+      `PrivacyBlockedError` → `None`, no provider called); try each provider in order; on
+      `LLMUnavailable` move to the next; **any answer** (a suggestion, a low-confidence
+      suggestion, or `None`) ends the walk — the fallback is never used for a weak/absent
+      answer, only for a failure.
+- [x] `explain_analytics(analytics) -> Explanation` (`provider` / `model` / `text`, all `None`
+      with no provider or all failed).
+- [x] `tests/test_llm_gateway.py` (13) — **the leak test**: a description with an account
+      number, a name, a phone and an email → the recorded provider payload contains none of
+      them and exactly the four allowlisted keys. Fallback on `LLMUnavailable`; **no** fallback
+      on a low-confidence answer or a `None`. Privacy-blocked → no provider call. Import-boundary
+      walk: only `llm_gateway.py` imports `app.llm.*`.
 
-#### P1-3. Deterministic categorization — `app/services/categorization.py` + `categorization_rules.py`
-- [x] `categorization_rules.py` — `MERCHANT_ALIASES`, `MERCHANT_CATEGORY` (exact merchant →
-      category, `RULE_CONFIDENCE_MERCHANT ≈ 0.97`), `KEYWORD_CATEGORY` (token → category,
-      `RULE_CONFIDENCE_KEYWORD ≈ 0.80`), credit-side rules. Confidences are named constants
-      with a "calibrate against real data" comment.
-- [x] `predict_category(merchant, direction) -> Prediction(category, confidence, source)` —
-      deterministic only (LLM hook is Part 2, inserted between keyword rules and the `NONE`
-      fallback).
-- [x] `resolve_category(session, txn) -> None` — the decision-7 invariant; writes `category` +
-      `category_source`.
-- [x] `categorize_statement(session, statement) -> None` — for each txn: `merchant_normalized`
-      = normalize; `predicted_*` = predict; then `resolve_category`. Skips a txn whose
-      `user_category` is already set. Idempotent.
-- [x] `tests/test_categorization.py` — merchant-map hit ≥ threshold assigns; keyword hit;
-      unknown → `Uncategorized`/`NONE`; a merchant rule beats prediction but loses to
-      `user_category`; deleting the rule restores the prediction; `categorize_statement`
-      idempotent; a transfer-type category is excluded from spending.
+### P2-4. Wire the LLM into categorization + a new endpoint  ✅
+- [x] `categorization.py`: `_llm_prediction` stub removed; `predict_category` is now
+      deterministic-only. `categorize_statement` runs `_llm_fill` between the rule pass and
+      `resolve_category` — one `suggest_category` call per unique `(merchant, direction)` whose
+      deterministic `predicted_source == "NONE"`, setting `predicted_source = "LLM"` on the
+      group. The 0.75 gate in `resolve_category` is untouched, so a weak LLM answer → Review
+      with the prediction retained. No provider → `suggest_category` returns `None` → identical
+      to Part 1.
+- [x] `app/api/analytics.py`: `GET /analytics/explanation?start=&end=` → `{provider, model,
+      text}`, all `null` with no key.
+- [x] Tests: `test_categorization.py` — LLM fills a `NONE` merchant (one call for two rows);
+      low-confidence LLM → `Uncategorized`/`NONE`, `predicted_category` kept; no-provider path
+      unchanged. `test_analytics.py` — the explanation endpoint with a fake provider and with
+      none.
 
-#### P1-4. Pipeline hook
-- [x] `processor.process_job`: `categorize_statement` after `validate_statement`, before
-      `mark_completed`. Worker test: a produced statement's transactions come out with
-      `merchant_normalized` + a resolved `category`.
-
-#### P1-5. Review lane + correction endpoints
-- [x] `GET /review/categorizations` — txns with `category_source == "NONE"`, grouped by
-      `merchant_normalized`, count + sample + the (sub-threshold) `predicted_category`.
-- [x] `app/api/transactions.py` (new) — `PUT /transactions/{id}/category {category}`:
-      validate ∈ `CATEGORIES`; set `user_category`; `resolve_category`; return the txn. **This
-      one transaction only.**
-- [x] `app/api/category_rules.py` (new) — `GET /category-rules`; `PUT /category-rules
-      {merchant, category}` (upsert, then `resolve_category` for every txn of that merchant
-      with no `user_category`); `DELETE /category-rules/{merchant}` (delete, then re-resolve —
-      predictions restored). Each returns the affected-row count.
-- [x] `GET /batches/{id}`: add `uncategorized_count`.
-- [x] `tests/test_transactions_api.py`, `tests/test_category_rules_api.py` — txn edit is
-      isolated; a rule flips only non-user siblings; deleting a rule reverts them; unknown
-      category → 422; bad id → 404.
-
-#### P1-6. Analytics on merchant + transaction type
-- [x] `analytics.py`: group `merchant_totals` / `recurring_charges` on `merchant_normalized or
-      description_normalized`. `spending_by_category` and the "spending" side of `trends` count
-      only spending categories (decision 3 / taxonomy helper). `cash_flow` stays literal
-      credits/debits but gains a `transfers_cents` line so a checking↔savings transfer is
-      visible, not hidden.
-- [x] Update `test_analytics.py`; add: two raw descriptions for one merchant now aggregate;
-      a `Transfers` debit is **not** in `spending_by_category`.
-
-#### P1-7. Part 1 checks & docs
-- [x] `uv run pytest` (≥ 90), `ruff check`, `ruff format --check`.
-- [x] `docs/activity.md`; `README.md` Status; `docs/manual-verification-categorization.md`.
-- [x] `tasks/todo.md` Part 1 Review.
-
-### Part 2 — Privacy Gateway + LLM
-
-> Load the `claude-api` skill before writing any Anthropic client code.
-
-#### P2-1. Privacy Gateway — `app/services/privacy_gateway.py`
-- [ ] `sanitize_text(s) -> str` — redact digit runs ≥ 6, card 13–19 digit groups, SSN, email,
-      phone, `ZELLE|VENMO|PAYPAL TO/FROM <name>` tails. Conservative.
-- [ ] `build_categorization_payload(merchant, description_normalized, amount_cents, direction)`
-      and `build_explanation_payload(analytics)` — small dicts, every string through
-      `sanitize_text`, **`description_raw` never a field**.
-- [ ] `tests/test_privacy_gateway.py` — account/routing/card/SSN/email/phone/`VENMO <name>`
-      redacted; merchant survives; payloads never carry `description_raw`.
-
-#### P2-2. Provider abstraction — `app/llm/`
-- [ ] `base.py` — `LLMProvider` protocol (`categorize`, `explain`), `CategorySuggestion`,
-      `LLMUnavailable`. `null.py` — `NullProvider`. `anthropic.py` / `openai.py` — `httpx`,
-      **model passed in, not hard-coded**, timeouts, any error → `LLMUnavailable`.
-- [ ] `uv add httpx` (promote to runtime); commit note.
-- [ ] `get_provider()` — `LLM_PROVIDER` + `{ANTHROPIC,OPENAI}_MODEL` + key from env; no key →
-      `NullProvider`.
-- [ ] `tests/test_llm_providers.py` — `NullProvider`; the two clients via a monkeypatched
-      `httpx` transport (no network); missing key → `NullProvider`.
-
-#### P2-3. The single gateway — `app/services/llm_gateway.py`
-- [ ] `suggest_category(merchant, description_normalized, amount_cents, direction)` and
-      `explain_analytics(analytics)` — payload → `privacy_gateway` → `get_provider()`. The only
-      module that touches both a payload and a provider.
-- [ ] `tests/test_llm_gateway.py` — **the build-plan leak test**: a merchant/description
-      carrying an account number and a full name; assert the string handed to the
-      (monkeypatched) provider contains neither. Assert nothing outside `app/llm/` +
-      `llm_gateway.py` imports `app.llm.*`.
-
-#### P2-4. Wire the LLM in
-- [ ] `predict_category`: after keyword rules and before `NONE`, if a provider is configured
-      call `llm_gateway.suggest_category`; result becomes `predicted_*` with
-      `predicted_source = "LLM"` (still subject to the 0.75 gate in `resolve_category`).
-      Deterministic path byte-identical when no provider.
-- [ ] `GET /analytics/explanation` — `build_analytics` → `llm_gateway.explain_analytics` →
-      `{provider, model, text}` or `{provider: null, text: null}` (REQ-LLM-201).
-- [ ] Tests: assisted path with a fake provider; no-provider path identical to Part 1;
-      endpoint with and without a provider.
-
-#### P2-5. Part 2 checks & docs
-- [ ] `pytest` (≥ 90), `ruff`, format.
-- [ ] `docs/activity.md`; `README.md` Status / Next up (→ #9); extend the manual-verification
-      doc (sanitizer + provider + "works with no key").
-- [ ] `tasks/todo.md` Part 2 Review.
+### P2-5. Checks & docs  ✅
+- [x] `uv run pytest` (221 passed, 97%), `ruff check`, `ruff format --check`. No real network.
+- [x] `docs/activity.md`; `README.md` Status / Next up (→ #9); `docs/manual-verification-llm.md`.
+- [x] `tasks/todo.md` Review section (below).
 
 ## Review
 
-### Part 1 — Rule-based categorization + merchant normalization (this PR)
+### Part 2 — Privacy Gateway + LLM layer (this PR)
 
-**Completed:** `app/models/taxonomy.py`, the `Transaction` columns + `CategoryRule` +
-migration `208f30aad50f`, `app/services/{merchant_normalization,categorization_rules,
-categorization}.py`, the `processor.py` hook, `app/api/{transactions,category_rules}.py` +
-`GET /review/categorizations` + `uncategorized_count`, and the analytics changes
-(merchant/transfer awareness). Branch `feature/categorization-privacy-llm` off
-`feature/analytics-engine` (stacked — PR #12 merges first).
+**Completed:** `app/services/privacy_gateway.py` (allowlist payload types + `sanitize_text` +
+fail-closed), `app/llm/` (`LLMProvider` protocol, `NullProvider`, `OpenAIProvider` /
+`AnthropicProvider` on raw `httpx`, `configured_providers()`), `app/services/llm_gateway.py`
+(the single chokepoint + fallback rule), the LLM phase in `categorize_statement`, and
+`GET /analytics/explanation`. `httpx` promoted to a runtime dep. Branch
+`feature/privacy-llm-gateway` off `main` (Part 1 = PR #13 merged).
 
-**Design (owner's locked decisions):**
-- The effective `category` is **resolved, not mutated**: `USER → MERCHANT RULE → prediction
-  (≥ 0.75) → Review`. `predicted_*` is stored separately and never discarded, so deleting a
-  rule or override restores it — `test_deleting_a_merchant_rule_restores_the_prediction`.
-- Fixed 22-category taxonomy, each with an `income` / `expense` / `transfer` type. Spending =
-  `expense` + `Uncategorized` debits only. Analytics enforces this everywhere.
-- `AUTO_ASSIGN_THRESHOLD = 0.75`, a named constant, to be calibrated against the 12 real
-  statements (optimize precision on auto-assigned).
-- Built-in rules live in code (`categorization_rules.py`), not seeded DB rows. `CategoryRule`
-  holds only user corrections. A `_validate()` at import guards against a rule naming a
-  category the taxonomy doesn't have.
-- A plain `PUT /transactions/{id}/category` is one row only; `PUT /category-rules` is the
-  explicit merchant-wide action.
+**Locked decisions honoured:** OpenAI primary (`gpt-5.6-luna`), Anthropic fallback
+(`claude-sonnet-5`); fallback **only** on `LLMUnavailable` (timeout / rate limit / HTTP / API /
+parse error), never on low confidence — a weak answer goes to Review like any sub-0.75
+prediction; provider and model are separate env vars; the outbound payload is a 4-field
+allowlist model built from primitives (never a serialized `Transaction`); merchant
+normalization stays local and pre-network; all Part 1 invariants preserved.
 
-**Deviations:** none of substance. `merchant_normalization` leaves corporate suffixes
-("Acme Corp", "Google Llc") — fine for v1. The LLM hook (`_llm_prediction`) is present but
-returns `None` until Part 2 (one uncovered line).
+**Deviation:** raw `httpx` for both provider clients rather than the `anthropic` SDK the
+`claude-api` skill recommends. Rationale: the codebase has no SDKs anywhere, keeps a small
+dependency surface (same ethos as "no pandas"), the calls are single JSON POSTs, and one
+transport gives uniform `MockTransport` testing. Contained behind `LLMProvider` — an SDK swap
+later touches one file.
 
-**Tests:** `uv run pytest` — **165 passed, 97% coverage** (gate 90). `ruff check` /
-`ruff format --check` clean. New: `test_merchant_normalization.py` (18),
-`test_categorization.py` (12), `test_transactions_api.py` (3), `test_category_rules_api.py`
-(5), + `test_review_api.py` / `test_analytics.py` additions.
+**Tests:** `uv run pytest` — **_TBD_ passed, _TBD_% coverage** (gate 90). No real network
+(every provider test uses `httpx.MockTransport`). New: `test_privacy_gateway.py` (24),
+`test_llm_providers.py` (18), `test_llm_gateway.py` (13, incl. the build-plan leak test and
+the import-boundary walk), plus `test_categorization.py` / `test_analytics.py` additions.
 
 **Known / follow-ups:**
-- Live-server manual E2E not run (dev DB locked, same as #7). Runbook:
-  `docs/manual-verification-categorization.md`.
-- Confidence constants (0.97 / 0.78 / 0.80) and the 0.75 gate are un-calibrated guesses —
-  needs a labelled pass over the real statements.
-- `merchant_normalization` and the built-in maps are small; they grow with real use and
-  Part 2's LLM fallback covers the gaps.
-
-### Part 2 — _(filled in when Part 2 is done)_
+- Live-server E2E with a real key not run. `docs/manual-verification-llm.md` is the runbook.
+- `gpt-5.6-luna` API shape assumed to be chat-completions; `anthropic-version: 2023-06-01`.
+  Confirm against a real call when a key is available.
+- Electron `safeStorage` + the Settings screen (real key handling) are build-plan #9; Part 2
+  reads env vars only.
+- Confidence calibration (the 0.75 gate, the rule confidences, and now the LLM's self-reported
+  confidence) still needs a labelled pass over the 12 real statements.

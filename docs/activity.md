@@ -838,3 +838,97 @@ Manual live-server E2E pending (dev DB still locked); runbook at
 (PR #12) — stacked; #12 merges first.
 
 **Next step:** build-plan #8 Part 2.
+
+---
+
+## 2026-09-08 — Privacy Gateway + LLM layer (build-plan #8, Part 2 of 2)
+
+**Prompt:** "merge PR #12 ... rebase ... push Part 1 as its own clean PR ... start Part 2 on a
+fresh branch `feature/privacy-llm-gateway`" + a detailed set of locked Part 2 decisions. Then
+"just merge. continue", then P2-1-specific privacy requirements, then "continue". Traces to
+`requirements.md` §12 (REQ-LLM-001..003, 101..103, 201).
+
+PR #12 (analytics) and PR #13 (categorization Part 1) merged; Part 1 rebased onto `main` first.
+Part 2 on `feature/privacy-llm-gateway` off `main`.
+
+**Locked decisions (owner):** OpenAI is the **primary** provider (`gpt-5.6-luna`), Anthropic
+the **fallback** (`claude-sonnet-5`); fallback fires **only on provider failure** (timeout,
+rate limit, HTTP/API error, unparseable) — **never** because the primary was unsure; a
+low-confidence LLM answer goes to Review like any sub-0.75 prediction; provider and model are
+separate env vars; the outbound payload carries only the minimum redacted fields; all Part 1
+invariants preserved.
+
+### P2-1 — Privacy Gateway (`app/services/privacy_gateway.py`, pure, network-free)
+
+- **`OutboundTransaction`** — a `frozen`, `extra="forbid"` model with exactly `merchant` /
+  `description` / `amount` / `direction`, **built from four primitives** — a `Transaction` is
+  never serialized and trimmed, so nothing else can ride along (allowlist, not scrub).
+  `OutboundAnalytics` does the same for the explanation path: aggregates only, no statement
+  ids / bank names / account identifiers.
+- **`sanitize_text`** redacts SSN, email, spaced card numbers, phone numbers, digit runs ≥ 7,
+  P2P transfer tails (`ZELLE|VENMO|CASHAPP|PAYPAL…` → whole tail dropped), and
+  `TRANSFER/WIRE/PYMT TO|FROM <Name>` name tails.
+- **Fail closed** — `build_categorization_payload` raises `PrivacyBlockedError` on a bad
+  direction, a non-int amount, a post-sanitize residual-PII scan hit (defense in depth), or
+  nothing left to classify. The gateway (P2-3) catches that → no LLM call → the transaction
+  falls to Review.
+- No raw or pre-sanitized content is logged in the module.
+- `test_privacy_gateway.py` (24) proves the **serialized** payload carries no forbidden fields
+  and none of the seeded PII, using adversarial descriptions (`ZELLE TO JOHN DOE`, card /
+  account / routing numbers, phone, email, SSN, names in transfer memos).
+
+### P2-2 — Provider abstraction (`app/llm/`)
+
+- `base.py` — `LLMProvider` protocol (`categorize` / `explain`), `CategorySuggestion`,
+  `LLMUnavailable`, and `parse_category_suggestion` (fence-strip, first `{…}`, validate the
+  category ∈ `CATEGORIES`, clamp confidence). Two failure modes kept distinct: **`None`** =
+  answered-but-unusable → Review, no fallback; **`LLMUnavailable`** = failed → fallback.
+- `null.py` — `NullProvider` (no key) returns `None` for everything → byte-identical to Part 1
+  (REQ-LLM-102).
+- `openai_provider.py` / `anthropic_provider.py` — **raw `httpx`**. The `claude-api` skill
+  recommends the Anthropic SDK; deviated deliberately — the codebase has no SDKs anywhere,
+  keeps a small dependency surface (same reasoning as "no pandas"), the calls are single JSON
+  POSTs, and one transport gives uniform `httpx.MockTransport` testing. An SDK swap later is
+  one file behind the `LLMProvider` interface. Injectable `client` for tests; any HTTP/parse
+  error → `LLMUnavailable`. Anthropic parses the first `text` block (thinking-safe) and
+  disables thinking for classification.
+- `providers.py` — `configured_providers()` builds the ordered chain from `LLM_PROVIDER`
+  (default `openai`) + the per-provider key/model env vars.
+- `httpx` promoted from a dev to a runtime dependency; `.env.example` added.
+- `test_llm_providers.py` (18) — all `app/llm/` files at 100%.
+
+### P2-3 — The single gateway (`app/services/llm_gateway.py`)
+
+The **only** module that imports both a Privacy Gateway payload builder and `app.llm`.
+`suggest_category` / `explain_analytics` build the sanitized payload, then walk the provider
+chain: skip a provider that raises `LLMUnavailable`, and **stop at the first provider that
+answers** — a suggestion, a weak suggestion, or `None` all end the walk; the fallback is only
+for a failure. `test_llm_gateway.py` (13) includes **the build-plan leak test** (a description
+with an account number, a name, a phone and an email → the recorded provider payload has none
+of them and exactly the four allowlisted keys) and an **import-boundary walk** asserting
+nothing outside the gateway imports `app.llm.*`.
+
+### P2-4 — Wired in
+
+- `categorization.py`: the `_llm_prediction` stub is gone; `predict_category` is
+  deterministic-only. `categorize_statement` runs `_llm_fill` between the rule pass and
+  `resolve_category` — **one `suggest_category` call per unique `(merchant, direction)`** whose
+  deterministic prediction was `NONE`, setting `predicted_source = "LLM"` on the group. The
+  0.75 gate is untouched, so a weak LLM answer → Review with the prediction retained. No
+  provider → `suggest_category` returns `None` → identical to Part 1.
+- `app/api/analytics.py`: `GET /analytics/explanation?start=&end=` → `{provider, model, text}`,
+  all `null` with no key.
+
+**Tests:** `uv run pytest` — **221 passed, 97% coverage** (gate 90). No real network anywhere
+in the suite (every provider test uses `httpx.MockTransport`). `ruff` clean.
+
+**Known / follow-ups:**
+- Live-server E2E with a real key not run — `docs/manual-verification-llm.md` is the runbook.
+- `gpt-5.6-luna` assumed to use the chat-completions endpoint; Anthropic `anthropic-version:
+  2023-06-01`. Confirm against a real call.
+- Electron `safeStorage` + the Settings screen (real key handling, "test connection") are
+  build-plan #9; Part 2 reads env vars only.
+- Confidence calibration (the 0.75 gate, the rule confidences, the LLM's self-reported
+  confidence) still needs a labelled pass over the 12 real statements.
+
+**Next step:** build-plan #9 — the frontend screens (Dashboard, Review, Settings, Accounts).
