@@ -1,35 +1,18 @@
-import { useEffect, useState } from 'react'
+import { Outlet } from 'react-router-dom'
+import { Toaster } from 'sonner'
+import { Sidebar } from './components/Sidebar'
+import { useTheme } from './hooks/useTheme'
 
-type HealthState =
-  | { status: 'loading' }
-  | { status: 'ok'; body: unknown }
-  | { status: 'error'; message: string }
-
-function App() {
-  const [health, setHealth] = useState<HealthState>({ status: 'loading' })
-
-  useEffect(() => {
-    fetch('http://127.0.0.1:8420/health')
-      .then((res) => res.json())
-      .then((body) => setHealth({ status: 'ok', body }))
-      .catch((err) =>
-        setHealth({ status: 'error', message: String(err) }),
-      )
-  }, [])
-
+/** The shell: sidebar + routed content. */
+export default function App() {
+  useTheme()
   return (
-    <main className="flex min-h-screen items-center justify-center bg-slate-950 text-slate-100">
-      <div className="rounded-lg border border-slate-800 bg-slate-900 px-8 py-6 text-center">
-        <h1 className="text-lg font-semibold">Bank Statement Analyzer</h1>
-        <p className="mt-2 text-sm text-slate-400">Backend health check</p>
-        <pre className="mt-4 text-sm">
-          {health.status === 'loading' && 'checking...'}
-          {health.status === 'ok' && JSON.stringify(health.body)}
-          {health.status === 'error' && `error: ${health.message}`}
-        </pre>
-      </div>
-    </main>
+    <div className="flex h-screen overflow-hidden">
+      <Sidebar />
+      <main className="flex-1 overflow-y-auto p-6">
+        <Outlet />
+      </main>
+      <Toaster position="bottom-right" richColors closeButton />
+    </div>
   )
 }
-
-export default App

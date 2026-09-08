@@ -67,8 +67,15 @@ description locally sanitized (account/card/routing numbers, SSNs, emails, phone
 transfer-recipient names) and a fail-closed check that routes a transaction to Review rather
 than send anything it can't vouch for. The provider is configurable (OpenAI primary, Anthropic
 fallback on provider failure only); with no API key the app is byte-identical to its
-deterministic self. Next: `build-plan.md` #9 — the frontend screens. Progress is logged in
-[`docs/activity.md`](./docs/activity.md), and written up for humans as a build log at
+deterministic self.
+
+The Electron/React frontend (`build-plan.md` #9, landing in three parts) is underway. The first
+slice is live: an app shell (sidebar nav, hash routing, TanStack Query, dark mode off the OS
+theme), an **Import** screen (drag-drop, per-file client pre-check, the backend's per-file
+accept/reject reasons, a non-blocking progress pill), and a **History** screen (`GET /batches`,
+paginated, expand a batch to see its statements and their validation status). Dashboard,
+Review, the transaction drawer, Accounts, and Settings follow in parts 2 and 3. Progress is
+logged in [`docs/activity.md`](./docs/activity.md), and written up for humans as a build log at
 [kervintznoel.com/posts](https://kervintznoel.com/posts/build-log-1-a-window-that-says-ok).
 
 ## What it does (v1)

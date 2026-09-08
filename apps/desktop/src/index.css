@@ -1,1 +1,22 @@
 @import 'tailwindcss';
+
+/* Drive dark mode off a `.dark` class on <html> (set from the OS theme by
+   useTheme), not the media query, so Electron's nativeTheme is the source. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  color-scheme: light dark;
+}
+
+body {
+  @apply bg-slate-50 text-slate-900 antialiased;
+}
+
+.dark body {
+  @apply bg-slate-950 text-slate-100;
+}
+
+/* Every dollar figure and date column uses this so digits line up. */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}

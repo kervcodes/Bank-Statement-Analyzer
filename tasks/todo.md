@@ -1,157 +1,204 @@
-# Todo: Build-plan #8 Part 2 — Privacy Gateway + LLM layer
+# Todo: Build-plan #9 — Frontend screens
 
-Branch `feature/privacy-llm-gateway` off `feature/categorization-privacy-llm` (Part 1, PR #13).
-Rebase onto `main` once #13 merges. Source: `build-plan.md` §8, `requirements.md` §12
-(REQ-LLM-001..003, 101..103, 201), `techstack.md` §11–§12.
-
-> **Load the `claude-api` skill before writing the Anthropic client.**
+Source: `build-plan.md` §9, `design-notes.md` §2–§6, `techstack.md` §3 (stack: Electron, Vite +
+React 19 + TS, Tailwind v4, TanStack Query; `design-notes` adds shadcn/ui + `lucide-react`).
+Branch `feature/frontend-screens` off `main` (backend feature-complete through #8).
 
 ## Goal
 
-1. A **Privacy Gateway** (`app/services/privacy_gateway.py`) is the *only* place a payload is
-   built for an LLM and the *only* place PII is stripped. No other module imports a provider
-   client (REQ-LLM-001).
-2. A **provider abstraction** (`app/llm/`) with an OpenAI and an Anthropic client, **provider
-   and model configured separately** by env var. The app is byte-identical to Part 1 when no
-   key is set (REQ-LLM-102).
-3. **LLM-assisted categorization** fills the gap the deterministic rules leave: a merchant the
-   rules don't know gets one LLM classification, still subject to the 0.75 gate.
-4. **`GET /analytics/explanation`** — a plain-English summary of the analytics payload, clearly
-   labelled with its provider (REQ-LLM-201). Never the source of a number.
+A working Electron/React app against the real backend: **Import, History, Dashboard, Review**
+(the four screens `build-plan` §9 names), plus the app shell, the transaction drawer, and the
+supporting screens (Accounts, Settings). Real batch progress and coverage — no mock data.
 
-## LOCKED decisions (owner, this session)
+## What exists now
 
-| # | Decision |
-|---|----------|
-| 1 | **OpenAI is primary**: `OPENAI_MODEL=gpt-5.6-luna`. Fallback: `ANTHROPIC_MODEL=claude-sonnet-5`. |
-| 2 | Fallback fires **only on provider failure** — timeout, rate limit, HTTP/API error, unparseable response. |
-| 3 | **Never** call the fallback because the primary returned low confidence. A low-confidence LLM result → Review, exactly like any sub-0.75 prediction. |
-| 4 | Provider and model are separate env vars: `LLM_PROVIDER` (`openai`\|`anthropic`, default `openai`), `OPENAI_MODEL`, `ANTHROPIC_MODEL`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`. |
-| 5 | The payload to a provider is the **minimum redacted fields for classification** — `{merchant, description, amount, direction}`-shaped. Never raw statements, `description_raw`, names, account/routing numbers, addresses, phone, email. |
-| 6 | Dev secrets: `.env`, backend process only. `safeStorage` + the Settings screen are build-plan #9 — Part 2 reads env vars and notes the handoff. |
+`apps/desktop` is the bare skeleton: one `App.tsx` that fetches `/health`. Tailwind v4 wired,
+Electron main spawns the backend, `oxlint` for linting, **no router, no data layer, no
+component library, no tests**. Backend API in place: `POST /batches`, `GET /batches/{id}`,
+`GET /analytics`, `GET /analytics/explanation`, `GET /review/duplicates`,
+`GET /review/categorizations`, `PUT /transactions/{id}/category`, `GET`/`PUT`/`DELETE
+/category-rules`.
 
-## Part 1 invariants to PRESERVE (do not redesign unless Part 2 exposes a real bug)
+## Backend gaps the frontend needs (small, additive — no migration)
 
-- Resolution order: `USER OVERRIDE → MERCHANT RULE → prediction ≥ 0.75 → Review`.
-- `predicted_*` stays separate from `user_category`; predictions are never discarded.
-- Merchant rules are non-destructive (delete restores the prediction).
-- Transfers and income never count as spending; `Uncategorized` debits do.
-- Merchant normalization runs **locally, before** anything crosses the network.
+| Endpoint | For | Notes |
+|---|---|---|
+| `GET /batches` | History list | id, created_at, counters, status, statement count. Ordered newest first. |
+| `GET /accounts` | Accounts screen | bank, type, masked id, statement count, date range. |
+| `GET /transactions/{id}` | Transaction drawer (§3.6) | amount, date, direction, category + source, `merchant_normalized`, `description_raw`, statement (bank/period), `source_page`, `parser_version`. |
+| `GET /transactions?…` | Drill-through from a chart/stat (§ principle 4) | filter by `category` / `merchant` / `start` / `end` / `statement_id`, over the deduplicated ledger. Paginated. |
+| `POST /statements/{id}/retry` *(maybe)* | Review "re-upload / retry" | only if a retry path is cheap; otherwise Review links to Import. |
 
-## Tasks
+Each gets a thin router + tests, same style as the existing API.
 
-### P2-1. Privacy Gateway — `app/services/privacy_gateway.py`  (pure, no network)  ✅
-Locked (owner): allowlist type not scrub; never serialize a `Transaction`; `merchant` from
-`merchant_normalized`; sanitize `description` before construction; **fail closed** →
-`PrivacyBlockedError` → no LLM → Review; no raw content ever an LLM arg; no logging of raw/
-pre-sanitized content; tests prove the serialized payload has no forbidden fields / seeded PII
-using adversarial examples.
-- [x] `OutboundTransaction` — a frozen, `extra="forbid"` Pydantic model with exactly
-      `merchant` / `description` / `amount` / `direction`. `OutboundAnalytics` similarly for
-      the explanation path (aggregates only — no statement ids, bank names, or account ids).
-- [x] `sanitize_text` — SSN, email, spaced-card (13–19), phone, digit-run ≥ 7, a P2P line
-      (`ZELLE|VENMO|CASHAPP|PAYPAL|…` → whole tail dropped), `TRANSFER/WIRE/PYMT/… TO|FROM
-      <Name>` name tail.
-- [x] `build_categorization_payload(*, merchant_normalized, description_normalized,
-      amount_cents, direction)` — four primitives in, `OutboundTransaction` out. Raises
-      `PrivacyBlockedError` on a bad direction, a non-int amount, a residual-PII scan hit
-      (defense in depth), or nothing left to classify.
-- [x] `build_explanation_payload(analytics)` — `OutboundAnalytics`; every merchant through
-      `sanitize_text`; ids/bank/account dropped.
-- [x] `tests/test_privacy_gateway.py` (23) — adversarial `ZELLE TO JOHN DOE`, card/account/
-      routing numbers, phone, email, SSN, names in transfer descriptions all gone from the
-      **serialized** payload; ordinary merchants survive; every fail-closed path; the
-      allowlist rejects an extra field. **188 passed, privacy_gateway.py 100% coverage.**
+## Frontend foundation
 
-### P2-2. Provider abstraction — `app/llm/`  ✅
-- [x] `base.py` — `LLMProvider` Protocol (`categorize` / `explain`), `CategorySuggestion`,
-      `LLMUnavailable`, and `parse_category_suggestion` (fence-strips, finds the first `{…}`,
-      validates the category ∈ `CATEGORIES`, clamps confidence). **`None` = answered-but-unusable
-      (→ Review, no fallback); `LLMUnavailable` = failed (→ fallback).**
-- [x] `null.py` — `NullProvider`, both methods `None`.
-- [x] `openai_provider.py` / `anthropic_provider.py` — raw `httpx` (deviation from the
-      `claude-api` skill's SDK recommendation — noted in `docs/activity.md`; rationale: the
-      codebase has no SDKs, keeps its dep surface small, and one transport = uniform
-      `MockTransport` testing). Injectable `client` for tests. Any HTTP/parse error →
-      `LLMUnavailable`. Anthropic: parses the first `text` block (thinking-block safe);
-      `categorize` disables thinking, `explain` leaves it adaptive.
-- [x] `providers.py` — `configured_providers()`: `LLM_PROVIDER` (default `openai`) picks the
-      order; each provider included only if its key is present; `[]` when neither.
-- [x] `uv add httpx` (promoted to runtime; removed the dev duplicate). `.env.example` created
-      with `LLM_PROVIDER` / `OPENAI_*` / `ANTHROPIC_*`.
-- [x] `tests/test_llm_providers.py` (18) — all `app/llm/` files at 100%. Good reply parsed;
-      unknown category / malformed → `None`; fenced JSON parsed; 500 / timeout / 429 →
-      `LLMUnavailable`; Anthropic skips a leading thinking block; `configured_providers()`
-      ordering for each `LLM_PROVIDER` and with keys missing. **205 passed, 97%.**
+- **Deps:** `@tanstack/react-query`, `react-router-dom` (hash router — Electron `file://`),
+  `lucide-react`, `class-variance-authority` + `clsx` + `tailwind-merge` (shadcn/ui utils),
+  `recharts` (Dashboard charts — see the `dataviz` skill), `@radix-ui/*` primitives as shadcn
+  components pull them in.
+- **shadcn/ui**: vendor the handful of primitives actually used (Button, Card, Table, Badge,
+  Sheet, Dialog, Tabs, Select, Input, Sonner/toast) into `src/components/ui/` — not the whole
+  library. Tailwind v4 config for the slate theme + CSS variables.
+- **Dark mode**: `dark:` variants off `nativeTheme.shouldUseDarkColors`, bridged through
+  `preload.ts` (`window.desktop.theme`), with an OS-change listener.
+- **App shell** (`design-notes` §2): left sidebar (Dashboard / Import / History / Review /
+  Accounts / Settings), Review badge count (from `/review/*` totals), a processing pill near
+  Import/History when any batch is `PROCESSING` (§5), routing, a `QueryClientProvider`, an
+  error boundary that shows a friendly message not a stack trace (§ principle 5, §error
+  states).
+- **`src/lib/api.ts`**: typed fetch wrappers + query keys, one base URL (`127.0.0.1:8420`).
+- **`src/lib/format.ts`**: `formatCents`, `formatDate`, `tabular-nums` helpers, the status →
+  {color, icon, label} map (§4 — colour is never the only signal).
 
-### P2-3. The single gateway — `app/services/llm_gateway.py`  ✅
-- [x] `suggest_category(...)` — build payload via `privacy_gateway` (a
-      `PrivacyBlockedError` → `None`, no provider called); try each provider in order; on
-      `LLMUnavailable` move to the next; **any answer** (a suggestion, a low-confidence
-      suggestion, or `None`) ends the walk — the fallback is never used for a weak/absent
-      answer, only for a failure.
-- [x] `explain_analytics(analytics) -> Explanation` (`provider` / `model` / `text`, all `None`
-      with no provider or all failed).
-- [x] `tests/test_llm_gateway.py` (13) — **the leak test**: a description with an account
-      number, a name, a phone and an email → the recorded provider payload contains none of
-      them and exactly the four allowlisted keys. Fallback on `LLMUnavailable`; **no** fallback
-      on a low-confidence answer or a `None`. Privacy-blocked → no provider call. Import-boundary
-      walk: only `llm_gateway.py` imports `app.llm.*`.
+## Screens
 
-### P2-4. Wire the LLM into categorization + a new endpoint  ✅
-- [x] `categorization.py`: `_llm_prediction` stub removed; `predict_category` is now
-      deterministic-only. `categorize_statement` runs `_llm_fill` between the rule pass and
-      `resolve_category` — one `suggest_category` call per unique `(merchant, direction)` whose
-      deterministic `predicted_source == "NONE"`, setting `predicted_source = "LLM"` on the
-      group. The 0.75 gate in `resolve_category` is untouched, so a weak LLM answer → Review
-      with the prediction retained. No provider → `suggest_category` returns `None` → identical
-      to Part 1.
-- [x] `app/api/analytics.py`: `GET /analytics/explanation?start=&end=` → `{provider, model,
-      text}`, all `null` with no key.
-- [x] Tests: `test_categorization.py` — LLM fills a `NONE` merchant (one call for two rows);
-      low-confidence LLM → `Uncategorized`/`NONE`, `predicted_category` kept; no-provider path
-      unchanged. `test_analytics.py` — the explanation endpoint with a fake provider and with
-      none.
+### Import (§3.2)
+- Drag-drop / browse; per-file rows with immediate **client-side** pre-check (extension, size)
+  showing `ready` / `rejected` before upload.
+- `POST /batches` (multipart) → the response's per-file `ACCEPTED` / `UPLOAD_FAILED` /
+  `VALIDATION_FAILED` with the specific reason.
+- "Start analysis (N)" — label shows the count that will actually process; never blocked by a
+  bad file.
+- On start → navigate to History (or a progress view) polling `GET /batches/{id}` until
+  terminal; toast on completion (§5).
 
-### P2-5. Checks & docs  ✅
-- [x] `uv run pytest` (221 passed, 97%), `ruff check`, `ruff format --check`. No real network.
-- [x] `docs/activity.md`; `README.md` Status / Next up (→ #9); `docs/manual-verification-llm.md`.
-- [x] `tasks/todo.md` Review section (below).
+### History (§3.3)
+- `GET /batches` table (TanStack Table): batch label (date range of its statements), date,
+  `processed / total`, status badge.
+- Expand a row → its statements (`GET /batches/{id}` → `statements[]`) with per-statement
+  `validation_result` / `dedup_status`, a retry action for retryable failures.
+- First-launch empty state routes to Import (§empty states).
+
+### Dashboard (§3.1)
+- Top: **coverage bar** — `GET /analytics` → `coverage` (included/excluded, date span). Green
+  pill when clean, expands amber with the excluded list when not; click → History filtered.
+  **Pinned above every figure** (§ principle 1).
+- Date-range filter top-right (all time / last 12 mo / this year / custom) → drives `start` /
+  `end` on every query. (Decision D-b below.)
+- Stat cards: net cash flow, monthly spending, top category — `tabular-nums`, each clickable →
+  drawer / filtered transaction list.
+- Cash-flow chart (12 mo, credits/debits/net, `transfers` shown separately) + spending-by-
+  category donut — `recharts`, each segment clickable, each with an accessible data-table
+  toggle (§accessibility).
+- Recurring charges + top merchants lists.
+- **AI summary panel** — `GET /analytics/explanation`; its own labelled box with the provider
+  tag and a Refresh button; when `provider` is null, a plain "add an API key in Settings"
+  empty state (§ principle 2).
+
+### Review (§3.4)
+- One list, three grouped sections:
+  - **Possible duplicates** — `GET /review/duplicates`; `[Keep both]` / `[This is a dup]`
+    (needs backend actions — see decision D-d).
+  - **Needs a category** — `GET /review/categorizations`; `[Confirm <suggested>]` /
+    `[Pick different]` → `PUT /transactions/{id}/category` (per-txn) or `PUT /category-rules`
+    (merchant-wide) — the two are distinct actions per the Part-1 design.
+  - **Failed / unsupported statements** — from `GET /batches` scan; `[Re-upload]` → Import.
+- Badge count = duplicates + uncategorized groups + failed statements.
+
+### Accounts (§3.5)
+- `GET /accounts` list. (Merge action → deferred; v1 is read-only + a note. Decision D-e.)
+
+### Settings (§3.7)
+- LLM provider radio + per-provider key field + "test connection"; data-retention toggle;
+  category-rules table (`GET`/`PUT`/`DELETE /category-rules`).
+- **Key storage**: Electron `safeStorage` via `preload.ts` → the main process writes the
+  encrypted blob and injects `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` into the backend spawn
+  env. The renderer never holds a key. (This is the piece deferred from #8 Part 2.)
+
+### Transaction drawer (§3.6)
+- shadcn `Sheet`, opens over any screen. `GET /transactions/{id}` → merchant, amount, date,
+  category (with `[edit]` → `PUT`), account, the **Source block** (statement, page, parser
+  version — always present), raw text.
+
+## Testing
+
+- Add **Vitest + React Testing Library + `@testing-library/jest-dom`** (`apps/desktop` has no
+  test runner). Cover the logic that hides bugs, not pixels: `format.ts` (currency, dates,
+  status map), the coverage-bar state machine (clean / warnings / failed), Import's per-file
+  pre-check, Review action wiring (with a mocked API). MSW for API mocking.
+- `apps/desktop/package.json`: `test`, `typecheck` (`tsc -b --noEmit`) scripts.
+- **CI**: add a `frontend` job to `.github/workflows/ci.yml` — `pnpm install`, `oxlint`,
+  `tsc`, `vitest run`. (Backend job unchanged.) Add `frontend` to the branch-protection
+  required checks once it's run green once.
+
+## Proposed split (3 PRs)
+
+1. **Foundation + Import + History + `GET /batches`** — the "did my upload work" loop, real
+   data end to end. Includes the shell, deps, theme, test setup, CI frontend job.
+2. **Dashboard + Review + Transaction drawer** + `GET /transactions/{id}`, `GET /transactions`,
+   the Review write actions.
+3. **Accounts + Settings + `safeStorage`** + `GET /accounts`.
+
+## LOCKED decisions (owner)
+
+- **Router:** `react-router-dom` v7, `createHashRouter`.
+- **Dashboard default:** last 12 months on first load; a date-range control is present.
+- **Charts:** Recharts. Financial values must also exist as accessible/drillable
+  numbers/tables, not only in a chart.
+- **Duplicate review actions:** `keep_both` → `UNIQUE`, `confirm` → `DUPLICATE`. No undo UI in
+  v1; both re-runnable; never delete the row; a confirmed duplicate stays
+  traceable/queryable but is excluded from analytics. `keep_both` = both are legitimate, not
+  "erase the review history". No migration just for audit history — existing dedup metadata is
+  enough.
+- **Accounts:** read-only in v1; merge deferred.
+- **PR 1 scope:** shell, sidebar/nav, routing, TanStack Query, shadcn foundation, dark mode,
+  Vitest + RTL, frontend CI, `GET /batches`, Import, History. **No Dashboard or Review.**
+- **Pagination:** no unbounded list endpoints. `GET /batches` gets `page` / `page_size` /
+  deterministic sort now. `GET /transactions` (PR 2) planned with `category` / `merchant` /
+  `account_id` / `batch_id` / `date_from` / `date_to` / `page` / `page_size` / `sort`.
+- **State boundaries:** TanStack Query = server state; local React state = UI-only; router
+  search params = navigation/filter state. No Redux/Zustand.
+- **Foundation stays minimal** — build only what Import + History need; not a design-system
+  project.
+
+## PR 1 — Foundation + Import + History  ✅
+
+- [x] **`GET /batches`** (`app/api/batches.py`) — paginated (`page` ≥1, `page_size` 1–100),
+      sort `created_at DESC, id DESC`, `{items, page, page_size, total}`; per-item statement
+      rollup (`statement_count` / `period_start` / `period_end`) in one grouped query. 4 tests.
+- [x] Deps: `@tanstack/react-query`, `react-router-dom` v7, `lucide-react`, `sonner`, shadcn
+      utils; dev `vitest` + RTL + `jsdom` + `msw`.
+- [x] Shell: `App.tsx` (sidebar + `<Outlet/>` + `<Toaster/>`), `Sidebar.tsx` (+ processing
+      pill), `ErrorBoundary`, `createHashRouter`, `QueryClientProvider` in `main.tsx`.
+- [x] `lib/api.ts` (typed fetch, `ApiError`), `lib/format.ts` (`formatPeriod` tz-safe,
+      `formatBytes`, status→`{tone,label,icon}` map), `lib/cn.ts`.
+- [x] `components/ui/` — `button`, `card`, `StatusBadge` (colour + icon + word, always).
+- [x] Dark mode: `.dark` on `<html>` from Electron `nativeTheme` via `preload.ts`
+      (`window.desktop`), `matchMedia` fallback; Tailwind v4 `@custom-variant dark`.
+- [x] `ImportRoute` — drag/browse, client pre-check per file, `POST /batches`, per-file result
+      badges + reasons, "Start analysis (N)" (ready count, never blocked), → History + toast.
+- [x] `HistoryRoute` — `GET /batches` table + pagination, expand → `GET /batches/{id}`
+      statements, empty state → Import, `?page` / `?batch` in the URL, polls while non-terminal.
+- [x] Dashboard / Review / Accounts / Settings routes = "lands in the next update" placeholders.
+- [x] Vitest: `format.test.ts`, `ImportRoute.test.tsx`, `HistoryRoute.test.tsx` (MSW) — 14
+      pass. `pnpm lint` / `pnpm typecheck` / `pnpm build` clean.
+- [x] CI `frontend` job (`pnpm install --frozen-lockfile` → lint → typecheck → test,
+      `ELECTRON_SKIP_BINARY_DOWNLOAD=1`).
+- [x] `docs/activity.md`, `README.md`, `docs/manual-verification-frontend-pr1.md`.
+
+## PR 2 / PR 3 (not started)
+
+- **PR 2:** Dashboard (§3.1) + Review (§3.4) + transaction drawer (§3.6) + `GET
+  /transactions/{id}` + `GET /transactions?…` + `POST /review/duplicates/{id}` + the
+  category-confirm wiring.
+- **PR 3:** Accounts (§3.5) + Settings (§3.7) + Electron `safeStorage` key handling + `GET
+  /accounts`.
 
 ## Review
 
-### Part 2 — Privacy Gateway + LLM layer (this PR)
+### PR 1
 
-**Completed:** `app/services/privacy_gateway.py` (allowlist payload types + `sanitize_text` +
-fail-closed), `app/llm/` (`LLMProvider` protocol, `NullProvider`, `OpenAIProvider` /
-`AnthropicProvider` on raw `httpx`, `configured_providers()`), `app/services/llm_gateway.py`
-(the single chokepoint + fallback rule), the LLM phase in `categorize_statement`, and
-`GET /analytics/explanation`. `httpx` promoted to a runtime dep. Branch
-`feature/privacy-llm-gateway` off `main` (Part 1 = PR #13 merged).
+**Completed:** `GET /batches`, the frontend shell + Import + History, Vitest+RTL, a `frontend`
+CI job. Branch `feature/frontend-screens` off `main`.
 
-**Locked decisions honoured:** OpenAI primary (`gpt-5.6-luna`), Anthropic fallback
-(`claude-sonnet-5`); fallback **only** on `LLMUnavailable` (timeout / rate limit / HTTP / API /
-parse error), never on low confidence — a weak answer goes to Review like any sub-0.75
-prediction; provider and model are separate env vars; the outbound payload is a 4-field
-allowlist model built from primitives (never a serialized `Transaction`); merchant
-normalization stays local and pre-network; all Part 1 invariants preserved.
+**Deviations:** dropped `<input accept>` (it hid the "not a PDF" reject state the screen must
+show; the JS pre-check is the sole gate). shadcn primitives hand-vendored, not CLI-generated.
+`techstack.md` §15's CI description is now stale (says ruff + pytest only) — flagged for the
+owner, not edited.
 
-**Deviation:** raw `httpx` for both provider clients rather than the `anthropic` SDK the
-`claude-api` skill recommends. Rationale: the codebase has no SDKs anywhere, keeps a small
-dependency surface (same ethos as "no pandas"), the calls are single JSON POSTs, and one
-transport gives uniform `MockTransport` testing. Contained behind `LLMProvider` — an SDK swap
-later touches one file.
+**Tests:** frontend `pnpm test:run` — 14 pass; `oxlint` + `tsc` clean; `pnpm build` produces
+all three bundles. Backend `uv run pytest` — 223 pass, 97%. Live-in-Electron E2E not run;
+runbook `docs/manual-verification-frontend-pr1.md`.
 
-**Tests:** `uv run pytest` — **_TBD_ passed, _TBD_% coverage** (gate 90). No real network
-(every provider test uses `httpx.MockTransport`). New: `test_privacy_gateway.py` (24),
-`test_llm_providers.py` (18), `test_llm_gateway.py` (13, incl. the build-plan leak test and
-the import-boundary walk), plus `test_categorization.py` / `test_analytics.py` additions.
-
-**Known / follow-ups:**
-- Live-server E2E with a real key not run. `docs/manual-verification-llm.md` is the runbook.
-- `gpt-5.6-luna` API shape assumed to be chat-completions; `anthropic-version: 2023-06-01`.
-  Confirm against a real call when a key is available.
-- Electron `safeStorage` + the Settings screen (real key handling) are build-plan #9; Part 2
-  reads env vars only.
-- Confidence calibration (the 0.75 gate, the rule confidences, and now the LLM's self-reported
-  confidence) still needs a labelled pass over the 12 real statements.
+### PR 2 / PR 3 — _(later)_
