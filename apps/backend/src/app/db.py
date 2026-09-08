@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from sqlalchemy import Engine, event
@@ -6,7 +7,10 @@ from sqlmodel import Session, create_engine
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-DATABASE_URL = f"sqlite:///{DATA_DIR / 'app.db'}"
+# Defaults to the app's local SQLite file. `APP_DATABASE_URL` overrides it for a
+# throwaway database (a scratch migration check, an ad-hoc script) without
+# touching the real one.
+DATABASE_URL = os.environ.get("APP_DATABASE_URL") or f"sqlite:///{DATA_DIR / 'app.db'}"
 
 
 @event.listens_for(Engine, "connect")

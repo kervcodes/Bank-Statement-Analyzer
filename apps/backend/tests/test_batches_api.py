@@ -131,6 +131,47 @@ def test_accepted_file_is_queued_and_processed_end_to_end(
     assert status["statements"][0]["validation_result"] == "VALID"
     assert status["statements"][0]["account_identifier_masked"] == "7890"
 
+    # build-plan #7: dedup ran on completion; a single statement is UNIQUE.
+    assert status["statements"][0]["dedup_status"] == "UNIQUE"
+    assert status["possible_duplicate_count"] == 0
+
 
 def test_get_batch_404_for_unknown_id(client: TestClient):
     assert client.get("/batches/does-not-exist").status_code == 404
+
+
+def test_reuploading_a_statement_in_a_second_batch_is_deduped(
+    client: TestClient,
+    session: Session,
+    session_factory: Callable[[], Session],
+):
+    """The same PDF in two batches: the second statement is collapsed, and the
+    ledger the analytics engine reads is unchanged (build-plan #7)."""
+    sample = build_santander_sample()
+
+    first = client.post(
+        "/batches", files=[("files", ("s.pdf", sample, "application/pdf"))]
+    ).json()
+    assert run_worker_once(session_factory) is True
+
+    second = client.post(
+        "/batches", files=[("files", ("s.pdf", sample, "application/pdf"))]
+    ).json()
+    assert run_worker_once(session_factory) is True
+    session.expire_all()
+
+    b1 = client.get(f"/batches/{first['batch_id']}").json()
+    b2 = client.get(f"/batches/{second['batch_id']}").json()
+    assert b1["statements"][0]["dedup_status"] == "UNIQUE"
+    assert b2["statements"][0]["dedup_status"] == "DUPLICATE"
+
+    from app.models import Transaction
+
+    live = session.exec(
+        select(Transaction).where(Transaction.dedup_status != "DUPLICATE")
+    ).all()
+    duped = session.exec(
+        select(Transaction).where(Transaction.dedup_status == "DUPLICATE")
+    ).all()
+    assert len(live) == 10  # the synthetic statement has 10 transactions
+    assert len(duped) == 10  # the whole re-upload

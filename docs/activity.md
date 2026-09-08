@@ -613,3 +613,71 @@ added by the user — both carried onto this branch, not authored here.
 
 **Next step:** build-plan.md #7 — deduplication and the deterministic analytics engine (first
 consumer of the now-populated canonical ledger).
+
+---
+
+## 2026-09-08 — Deduplication (build-plan #7, Part A of 2)
+
+**Prompt:** "proceed with the next step in the plan in a new branch" → "yes you can split it into
+two PRs". Build-plan #7 is split: **Part A — deduplication** (this PR), **Part B — the analytics
+engine** (a follow-up branch once A merges). Traces to `requirements.md` §9 (REQ-DEDUP-001..004),
+NFR-MAINT-002.
+
+**Housekeeping first:** `AGENTS.md` (the user's mirror of `CLAUDE.md`'s workflow rules) was
+committed straight to `main` (`1e278a4`, admin-bypassed the `backend` check — docs-only file).
+
+**Two-pass dedup, runs once when a batch first reaches a terminal state** (inside
+`workers/coordinator.py::refresh_batch`, guarded on the `PROCESSING → terminal` transition):
+- **Statement-level** (`_find_matching_statement`): an exact match on `(account_id, period,
+  opening_cents, closing_cents)` against an existing non-duplicate statement is the same PDF
+  re-uploaded. The newer statement and **all** its transactions → `DUPLICATE` of the older;
+  transaction-level is skipped for it.
+- **Transaction-level** (`_dedup_transactions`): only for statements not whole-duplicates, and
+  only across *different* same-account statements whose periods overlap. Match key
+  `(iso date, amount_cents, direction, casefolded normalized description)`. A clean 1:1 match
+  inside the overlap → `DUPLICATE`; ambiguous cardinality (n:m identical charges) → every row
+  kept, the newer ones flagged `POSSIBLE_DUPLICATE` (REQ-DEDUP-004: a missed duplicate is
+  acceptable, a wrongly deleted real transaction is not). Two identical same-day charges
+  *within one statement* are never compared to each other.
+
+Dedup **never deletes a row** and **never changes batch status** — a re-uploaded duplicate is
+expected, not a warning; `POSSIBLE_DUPLICATE`s surface in Review instead.
+
+**Schema / migration `6518b8bf3cfe`:**
+- `Statement`: `dedup_status` (`UNIQUE`/`DUPLICATE`/`POSSIBLE_DUPLICATE`, CHECK), self-FK
+  `duplicate_of_id`, and `created_at` (so dedup can pick the *older* statement as canonical —
+  `Statement` had no timestamp before).
+- `Transaction`: `dedup_status` + self-FK `duplicate_of_id`, plus a nullable `reference_id`
+  (REQ-DEDUP-002 names it; the Santander parser doesn't extract one yet).
+- SQLite can't add a constraint or self-FK in place → `batch_alter_table` (rebuild). The
+  rebuild's `DROP TABLE statement` trips FK enforcement on a **populated** db, so the migration
+  emits `PRAGMA foreign_keys=OFF` around the batch ops (Alembic runs SQLite DDL
+  non-transactionally, so the PRAGMA takes effect). Tested on a fresh db (up/down/up) and on a
+  seeded db (rows + FKs preserved, integrity clean after).
+- `app/db.py` gained an `APP_DATABASE_URL` env override so a throwaway db can be pointed at
+  without touching the real one (used to test the migration).
+
+**API:**
+- `GET /batches/{id}`: each statement gains `dedup_status`; a top-level
+  `possible_duplicate_count`.
+- **New `GET /review/duplicates`** (`app/api/review.py`) — the flagged `POSSIBLE_DUPLICATE`
+  transactions paired with what each may duplicate. Read-only; the keep-both / merge actions
+  come with the Review UI (#9).
+
+**The "unified deduplicated ledger"** that Part B's analytics will read: transactions where
+`dedup_status != 'DUPLICATE'` and whose statement is neither `DUPLICATE` nor `FAILED`
+(`WARNING` statements and `POSSIBLE_DUPLICATE` transactions are kept in).
+
+**Tests:** `uv run pytest` — **105 passed, 96% coverage** (gate 90). `ruff check` /
+`ruff format --check` clean. New: `test_deduplication.py` (re-upload collapses; different month
+doesn't; `FAILED` statement skipped; overlapping statements collapse shared transactions;
+ambiguous cardinality → `POSSIBLE_DUPLICATE`, nothing deleted; identical same-day charges in one
+statement both kept; `run_dedup_for_batch` idempotent), `test_review_api.py` (empty +
+one-pair), and a `test_batches_api.py` case that POSTs the same synthetic statement in two
+batches through the real worker → second `Statement` `DUPLICATE`, ledger unchanged (10 live /
+10 duped transactions).
+
+**Not done here** (Part B): the analytics engine, `GET /analytics`, the ledger query helper,
+coverage summary, recurring-charge detection. Manual live-server E2E for dedup is pending — the
+dev `data/app.db` is still locked by an open DB Browser; the automated two-batch worker test
+covers the same path.

@@ -1,304 +1,229 @@
-# Todo: Build-plan #6 — First bank parser, end to end (Santander checking)
+# Todo: Build-plan #7 — Deduplication and the analytics engine
 
-Source: `build-plan.md` §6, tracing to `requirements.md` §5 (REQ-DET-001..004), §6
-(REQ-NORM-001..006), §7 (REQ-ACC-001..002), §8 (REQ-VAL-001..005), and NFR-MAINT-001/002.
+Source: `build-plan.md` §7, tracing to `requirements.md` §9 (REQ-DEDUP-001..004), §10
+(REQ-ANLY-001..004), §13.1 (REQ-RPT-001..003), NFR-MAINT-002 (dedup confidence scoring is a
+must-test area), `techstack.md` §10.
 
 ## Goal (what "done" means for this step)
 
-A real Santander checking PDF dropped into `POST /batches` is picked up by the background
-worker, its bank/account-type/layout is detected from the **text content** with a confidence
-score, a versioned `santander_checking_v1` parser normalizes it into the canonical schema, the
-three-level financial validation runs, and the result is a `Statement` row + `Transaction` rows
-+ a resolved `Account` row with `validation_result` set — or, if detection confidence is below
-threshold, the job ends `UNSUPPORTED` and **no `Statement` row is created** (REQ-VAL-005).
+1. When a batch finishes processing, its new statements are checked for duplicates —
+   **statement-level first** (same PDF uploaded twice), then **transaction-level** for the
+   partial-overlap case (a "last 90 days" statement overlapping three monthly ones). Three
+   outcomes, never a silent delete (REQ-DEDUP-003/004): `UNIQUE`, `DUPLICATE` (auto-collapsed,
+   excluded from the ledger), `POSSIBLE_DUPLICATE` (kept, flagged for Review).
+2. A `GET /analytics` endpoint computes cash flow, spending by category, recurring charges,
+   merchant totals, and period-over-period trends **deterministically** over the unified,
+   deduplicated ledger (REQ-ANLY-001/003), plus a coverage summary (REQ-RPT-001), as one
+   structured JSON payload (REQ-ANLY-004).
 
-This is the milestone where a real PDF goes in and a validated, normalized statement comes out.
-
-**Not in scope** (later steps): deduplication and analytics (#7), categorization + merchant
-normalization + Privacy Gateway + LLM (#8), all frontend screens (#9), packaging (#10),
-provisional/ambiguous account handling (REQ-ACC-003/004, both `Should`), parsers for any other
-institution.
+**Not in scope** (later steps): rule-based categorization + merchant normalization + the
+Privacy Gateway + any LLM call (#8) — analytics here runs on `category` as it stands (mostly
+`Uncategorized`) and groups recurring charges by `description_normalized`; the Review UI, the
+Dashboard, and every other screen (#9); packaging (#10). No user-facing "merge / keep both"
+action yet — this step produces the data those buttons will act on.
 
 ## State of the repo right now
 
-- Build-plan #5 is **PR #8, open** (CI green, mergeable). `main` is at build-plan #4.
-- `process_job` (`app/workers/processor.py`) currently: `extract_text()` → `mark_completed`.
-  This step inserts detection → parse → normalize → validate between those.
-- `RetryableJobError` hook exists in `processor.py`, unused so far — #6 is its first real user.
-- `UNSUPPORTED` is in `JOB_STATUSES` / `TERMINAL_JOB_STATUSES` but nothing produces it yet —
-  #6 is the first producer.
-- `Statement` / `Transaction` / `Account` SQLModel tables already exist with all needed fields
-  (`validation_result` nullable, money as integer cents, `source_page`, `parser_version`, …).
-- No sample statements in the repo. No `parsers/` or detection/normalization/validation
-  modules yet.
-
-## Step 0 — merge PR #8 first (recommended)
-
-Same reasoning as last step: stacked PRs on feature branches have twice left `main` behind.
-Merge PR #8, then branch `feature/santander-parser` off an updated `main`. If you'd rather not,
-I stack it on `feature/job-queue`.
+- `main` is at build-plan #6 (PR #10 merged). The pipeline ends at per-statement financial
+  validation; `Statement.validation_result` is `VALID` / `WARNING` / `FAILED`.
+- `Transaction` has `category` (always `None` so far) and `description_normalized` (light
+  whitespace cleanup only — real merchant normalization is #8).
+- `workers/coordinator.py::refresh_batch` is called after every job transition and flips the
+  batch to a terminal status once all jobs are terminal. It is idempotent.
+- Money is integer cents everywhere; `Decimal` only at read time for ratios (`models/money.py`).
+- No analytics or dedup code exists yet.
 
 ## Decisions to confirm before I write code
 
-1. **First parser: `santander_checking_v1`** — confirmed. Registry key
-   `("Santander", "checking", "v1")`.
+**1. Where dedup runs.** Inside `refresh_batch`, at the moment it transitions a batch from
+`PROCESSING` to a terminal status (guarded so it runs **once** per batch). It dedups that
+batch's new `VALID`/`WARNING` statements against the existing ledger. Rationale: dedup mutates
+the ledger and only needs to happen when statements are added, not on every analytics read.
 
-2. **Detection is registry-driven.** Each parser module exposes
-   `detect(pages: list[PageText]) -> float` (0.0–1.0). `services/detection.py` runs every
-   registered parser's `detect`, picks the highest, and returns
-   `DetectionResult(bank, account_type, layout_version, confidence)`. Keeps layout-specific
-   matching next to the parser that owns that layout (REQ-DET-001/003).
+**2. Analytics is computed on demand**, not materialized. `GET /analytics` runs the whole
+computation from the DB each call (optionally filtered by date range). For a single-user local
+app with thousands of transactions this is fast enough and avoids a cache-invalidation
+concern. Revisit if a real batch makes it slow.
 
-3. **Confidence threshold = 0.70.** `confidence < 0.70` → job `UNSUPPORTED`, no `Statement`
-   (REQ-DET-002, REQ-VAL-005). A confidently-wrong parser is worse than a clear "unsupported".
+**3. No `pandas`.** `techstack.md` §10 suggests it "for the aggregation-heavy parts". I
+recommend **plain Python + `Decimal` + stdlib** (`itertools.groupby`, dict accumulation)
+instead: it's arithmetic over a few thousand rows, and `pandas` (plus `numpy`) is a heavy
+dependency to bundle into the PyInstaller binary in #10 for no measured benefit. Add it later
+if aggregation ever becomes a measured bottleneck. Say if you'd rather stay on the spec.
 
-4. **Reconciliation tolerance = exact (0 cents).** `opening + Σcredits − Σdebits == closing`
-   exactly → the reconciliation level passes. Any nonzero difference → that level `FAILED`.
-   Money is integer cents and a correct parse of a correct statement reconciles exactly; a
-   mismatch means a missed or misread line, which is exactly what this app exists to catch.
-   (If real Santander statements turn out to carry a legitimate sub-cent interest rounding
-   line, I'll bring back a small configurable tolerance and flag it — not assumed up front.)
+**4. Statement-level duplicate = exact match** on `(account_id, statement_start_date,
+statement_end_date, opening_balance_cents, closing_balance_cents)`. That is the same statement
+period with the same reconciled endpoints — a re-upload. → `HIGH` confidence → the newer
+statement becomes `DUPLICATE` of the older, **all its transactions** are marked `DUPLICATE`
+too, and transaction-level dedup is skipped for it. This catches essentially every real case
+("I uploaded March twice").
 
-5. **Three validation levels → one `validation_result`:**
-   - **structural** (required fields present: both dates, both balances, `parser_version`,
-     ≥1 transaction) fails → `FAILED`.
-   - **transaction-level** (each txn: date within statement period, `amount_cents ≥ 0`,
-     `direction ∈ {DEBIT,CREDIT}`, non-empty description) fails → `WARNING` (the numbers may
-     still reconcile; the statement is usable but flagged).
-   - **reconciliation** (decision 4) fails → `FAILED`.
-   - all pass → `VALID`.
-   Written to `Statement.validation_result`. `extraction_status` stays `SUCCESS` unless the
-   parser explicitly reports pages it could not read (`PARTIAL`).
+**5. Transaction-level dedup** runs only for statements **not** flagged as whole-statement
+duplicates, and only compares transactions across **different statements of the same account
+whose periods overlap**. Match key: `(transaction_date, amount_cents, direction,
+description_normalized)`.
+  - Exactly one match in an older statement, on a date inside the period overlap → `HIGH` →
+    the newer transaction becomes `DUPLICATE`.
+  - Several candidate matches (e.g. two identical charges in each statement) → **all kept**,
+    the newer ones marked `POSSIBLE_DUPLICATE` (REQ-DEDUP-004: a missed duplicate is
+    acceptable, a wrongly deleted real transaction is not). This is the design-notes §3.4
+    "08/14 Starbucks $7.82 (statement A) / (statement B)" case.
+  - No match → `UNIQUE`.
+  Two identical same-day charges **within one statement** are never compared to each other —
+  they are both real.
 
-6. **Minimal account resolution now.** `services/normalization.py` resolves an `Account` by
-   `(bank, account_type, account_identifier_masked)` — reuse if it exists, create if not
-   (REQ-ACC-001: never store the full number; REQ-ACC-002: two accounts at one bank stay
-   separate). Add a unique index on those three columns. Ambiguous-match → provisional account
-   for user confirmation (REQ-ACC-003/004) is deferred — both are `Should`.
+**6. Reconciliation is not re-checked after collapse.** A `DUPLICATE` transaction keeps its
+row (for traceability, REQ-RPT-003) and its statement's `validation_result` is unchanged; it
+is simply excluded from the ledger view analytics reads. The statement it duplicates already
+reconciled on its own.
 
-7. **`StatementJob` gains `statement_id: str | None`** (nullable FK → `statement.id`), so a
-   completed job links to the statement it produced and a `FAILED`/`UNSUPPORTED` job clearly
-   produced none (REQ-VAL-005). One autogenerated migration.
+**7. New nullable `Transaction.reference_id`** column added now (the Santander parser doesn't
+extract one yet; REQ-DEDUP-002 names it as a signal). Populated by a later parser change; the
+dedup code uses it as a tie-breaker when present.
 
-8. **Parser returns Pydantic models, not DB rows.** `parsers/base.py` defines
-   `ParsedStatement` / `ParsedTransaction` (plain Pydantic, amounts as `Decimal`). The parser
-   never touches the DB; `normalization.py` is the only thing that writes rows and the only
-   place `to_cents` is called (so `SubCentPrecisionError` is caught in one place). Matches the
-   techstack.md §9 split between the canonical Pydantic shape and the storage models.
+**8. The "unified deduplicated ledger"** that analytics reads = transactions where
+`dedup_status != 'DUPLICATE'` **and** whose statement has `dedup_status != 'DUPLICATE'`
+**and** `validation_result != 'FAILED'` (REQ-VAL-003). `WARNING` statements and
+`POSSIBLE_DUPLICATE` transactions **are** included (kept-both).
 
-9. **`description_normalized` = light cleanup only** at this step: collapse whitespace, strip a
-   trailing reference/confirmation number. Real merchant normalization ("UBER *TRIP" → "Uber")
-   is build-plan #8. `description_raw` is stored verbatim and never overwritten (REQ-NORM-002).
+**9. Analytics amounts are integer cents** in the JSON (`*_cents` fields), consistent with the
+rest of the codebase; percentages / trend ratios are `Decimal`-computed and returned as
+strings. The frontend (#9) formats for display; #8 will build the LLM its own sanitized shape.
 
-10. **Real PDFs never enter the repo.** `apps/backend/tests/fixtures/statements/local/` holds
-    your real Santander PDFs — `*.pdf` is already gitignored repo-wide, so only the folder's
-    `README.md` / `.gitkeep` are tracked. The committed synthetic fixture is a **Python
-    builder** (`tests/fixtures/statements/santander_checking_v1.py` → `build_santander_sample()
-    -> bytes` plus expected-value constants), not a checked-in binary — matches how
-    `tests/_pdf.py` already works and sidesteps the `*.pdf` ignore rule. A golden-file test
-    against `local/*.pdf` runs when the files are present and is `skipif`-skipped otherwise.
+## New / changed models (one migration)
 
-## Error classification (extends build-plan #5's table)
-
-| Failure | Job outcome | Retryable? |
-|---|---|---|
-| `ExtractionFailedError` (OCR engine, bad render, missing binary) | `RETRYING` → `FAILED` | yes (×2) |
-| Detection `confidence < 0.70` | `UNSUPPORTED` | no — deterministic |
-| `ParserError` (layout matched, a field/line could not be parsed) | `FAILED` | no — deterministic |
-| `SubCentPrecisionError` during normalization | `FAILED` | no — misread, not transient |
-| `RetryableJobError` (parser explicitly signals transient) | `RETRYING` → `FAILED` | yes (×2) |
-| any other exception | `FAILED` + `logger.exception` | no |
-
-A statement that parses cleanly but fails **validation** is still a `COMPLETED` job with a
-`Statement` row — `validation_result` carries the bad news, and the batch coordinator downgrades
-the batch to `COMPLETED_WITH_WARNINGS` (decision below). Validation failure is not a job failure.
-
-## New processing flow (`process_job`)
-
-```
-extract_text(pdf)                      # unchanged; ExtractionFailedError → retryable
-      ↓
-detect(pages)                          # services/detection.py
-      ↓  confidence < 0.70  ──►  mark_unsupported(job, reason) ──► refresh_batch ──► return
-      ↓
-parser = get_parser(bank, account_type, layout_version)   # parsers/registry.py
-parsed = parser.parse(pages)           # ParserError → FAILED (non-retryable)
-      ↓
-statement = normalize(session, parsed, batch_id=job.batch_id)   # Statement + Transactions + Account
-      ↓
-statement.validation_result = validate_statement(session, statement)   # services/financial_validation.py
-      ↓
-mark_completed(job, method=..., page_count=..., statement_id=statement.id)
-      ↓
-refresh_batch(job.batch_id)
-```
+- `Statement`: `dedup_status: str` (default `"UNIQUE"`, CHECK in `UNIQUE` / `DUPLICATE` /
+  `POSSIBLE_DUPLICATE`), `duplicate_of_id: str | None` FK → `statement.id` (indexed).
+- `Transaction`: `dedup_status: str` (same values + CHECK), `duplicate_of_id: str | None` FK →
+  `transaction.id` (indexed), `reference_id: str | None`.
+- `DEDUP_STATUSES` tuple in `models/canonical.py`, exported from `models/__init__.py`.
 
 ## Tasks
 
-### 1. Fixtures scaffolding
-- [x] `apps/backend/tests/fixtures/statements/local/` created with `README.md` + `.gitkeep`
-      (real PDFs there are covered by the existing repo-wide `*.pdf` ignore rule).
-- [x] Extend `tests/_pdf.py` so it can build a multi-line, multi-page text PDF from arbitrary
-      strings (current helper is a single fixed page). No new dependency.
-- [x] `tests/fixtures/statements/santander_checking_v1.py`: `build_santander_sample() -> bytes`
-      plus `EXPECTED_*` constants — a synthetic Santander checking statement mirroring the real
-      layout (header with bank name + masked account, statement period, beginning/ending
-      balance, a deposits section and a withdrawals section, ~8–12 transactions that reconcile
-      exactly). **Built after I've seen a real PDF** so the layout matches.
+### Part A — Deduplication
 
-### 2. Parser contract — `app/parsers/base.py`
-- [x] `ParsedTransaction` (Pydantic): `transaction_date`, `posted_date`, `description_raw`,
-      `description_normalized`, `amount: Decimal`, `direction`, `balance_after: Decimal | None`,
-      `source_page`.
-- [x] `ParsedStatement` (Pydantic): `bank`, `account_type`, `account_identifier_masked`,
-      `statement_start_date`, `statement_end_date`, `opening_balance: Decimal`,
-      `closing_balance: Decimal`, `parser_version`, `transactions: list[ParsedTransaction]`,
-      `unreadable_pages: list[int]` (drives `extraction_status`).
-- [x] `class ParserError(Exception)` — deterministic parse failure.
-- [x] `Parser` `Protocol`: `parse(pages) -> ParsedStatement`, `detect(pages) -> float`,
-      `parser_version: str`, registry key attributes.
+#### A1. Model + migration
+- [x] Add the columns/constraints above to `canonical.py`; export `DEDUP_STATUSES`.
+- [x] `uv run alembic revision --autogenerate`; review (SQLite needs `batch_alter_table` for
+      the new FKs/constraints — same as migration `69a3cd180f72`); `uv run alembic upgrade head`.
 
-### 3. Registry — `app/parsers/registry.py`
-- [x] `PARSERS: dict[tuple[str, str, str], Parser]` keyed by `(bank, account_type, layout_version)`.
-- [x] `register(parser)` and `get_parser(bank, account_type, layout_version) -> Parser`
-      (raises `KeyError` → caller turns that into `UNSUPPORTED`).
-- [x] `all_parsers() -> list[Parser]` for detection to iterate.
+#### A2. Dedup service — `app/services/deduplication.py`
+- [x] `dedup_statement(session, statement) -> DedupOutcome` — statement-level exact match
+      (decision 4). If matched: set `dedup_status`/`duplicate_of_id` on the statement and all
+      its transactions, return early.
+- [x] `dedup_transactions(session, statement)` — transaction-level (decision 5), only for
+      non-whole-duplicate statements. Pure DB reads + writes, no FastAPI imports.
+- [x] `run_dedup_for_batch(session, batch_id)` — orchestrates: for each `VALID`/`WARNING`
+      statement in the batch (oldest first), statement-level then transaction-level. Idempotent
+      (safe to re-run: an already-classified statement is skipped).
 
-### 4. Detection — `app/services/detection.py`
-- [x] `DetectionResult` dataclass: `bank`, `account_type`, `layout_version`, `confidence`.
-- [x] `detect(pages) -> DetectionResult`: run every parser's `detect`, return the best.
-- [x] `CONFIDENCE_THRESHOLD = 0.70`.
+#### A3. Hook into the coordinator
+- [x] `refresh_batch`: when it transitions the batch `PROCESSING` → terminal, call
+      `run_dedup_for_batch` before returning. Guard so it fires once.
 
-### 5. Santander parser — `app/parsers/santander_checking_v1.py`
-- [x] `detect(pages)`: weighted score over layout markers on page 1 (bank name, "Checking"
-      product marker, "Beginning Balance"/"Ending Balance", section headers). Tuned against the
-      real PDFs.
-- [x] `parse(pages)`: extract statement metadata + transactions. Section membership
-      (deposits/credits vs withdrawals/debits) sets `direction`. Dates parsed to `date`.
-      Amounts kept as `Decimal`. `description_normalized` = whitespace-collapsed + trailing
-      ref stripped. Anything that doesn't parse → `ParserError` (never a silent skip).
-- [x] `register()` into the registry on import.
+#### A4. Read endpoint
+- [x] `GET /batches/{id}` (extend): each statement gains `dedup_status`; add a top-level
+      `possible_duplicate_count` for the batch.
+- [x] `GET /review/duplicates` — the flagged `POSSIBLE_DUPLICATE` transactions grouped with
+      what they match (feeds design-notes §3.4). Thin; no actions yet.
 
-### 6. Normalization — `app/services/normalization.py`
-- [x] `normalize(session, parsed: ParsedStatement, *, batch_id) -> Statement`:
-      resolve/create `Account` by `(bank, account_type, account_identifier_masked)`; create the
-      `Statement` (`extraction_status` = `PARTIAL` if `parsed.unreadable_pages` else `SUCCESS`,
-      `validation_result=None`); create `Transaction` rows with `statement_id`, `account_id`,
-      `source_page`, `source_bank`, `amount_cents` via `to_cents`.
-- [x] `SubCentPrecisionError` propagates (caller marks the job `FAILED`).
-- [x] Unique index on `Account (bank, account_type, account_identifier_masked)`.
+#### A5. Tests — `tests/test_deduplication.py` (NFR-MAINT-002)
+- [x] Statement-level: upload the same synthetic statement in two batches → the second
+      statement is `DUPLICATE`, `duplicate_of_id` points at the first, all its transactions
+      `DUPLICATE`, ledger count unchanged.
+- [x] Not a duplicate: a different month for the same account → both `UNIQUE`.
+- [x] Transaction-level overlap: a statement covering a range that overlaps an existing one,
+      sharing some transactions → the shared ones in the newer statement are `DUPLICATE`, the
+      non-overlapping ones `UNIQUE`.
+- [x] Ambiguous: two identical same-day charges in each of two overlapping statements → newer
+      ones `POSSIBLE_DUPLICATE`, nothing deleted, all four rows still present.
+- [x] Same-day identical charges within one statement are both `UNIQUE`.
+- [x] `run_dedup_for_batch` is idempotent (second call is a no-op).
+- [x] A `FAILED`-validation statement is skipped by dedup entirely.
 
-### 7. Financial validation — `app/services/financial_validation.py`
-- [x] `validate_statement(session, statement) -> str` returning `VALID` / `WARNING` / `FAILED`,
-      running the three levels in decision 5. Pure read + arithmetic in integer cents; ratios
-      never involved here.
-- [x] Reconciliation compares `opening_balance_cents + Σcredit − Σdebit` to
-      `closing_balance_cents` exactly.
+### Part B — Analytics engine
 
-### 8. Wire into the worker
-- [x] `app/workers/queue.py`: `mark_unsupported(session, job, reason)` (terminal, no attempt
-      bump — it's not a failed attempt); `mark_completed` gains `statement_id`.
-- [x] `app/models/jobs.py` + migration: `StatementJob.statement_id: str | None` FK.
-- [x] `app/workers/processor.py`: the new flow above, with the error table's classification.
-- [x] `app/workers/coordinator.py`: a batch whose completed jobs produced a `Statement` with
-      `validation_result` in `{WARNING, FAILED}` → `COMPLETED_WITH_WARNINGS` (REQ-VAL-003 /
-      REQ-RPT-002), even when every job is `COMPLETED`.
+#### B1. Ledger query — `app/services/ledger.py`
+- [ ] `ledger_transactions(session, *, start=None, end=None) -> list[Transaction]` — the
+      unified deduplicated ledger (decision 8), optional date filter on `transaction_date`.
+- [ ] `coverage_summary(session, *, start=None, end=None) -> Coverage` — statements included vs
+      excluded (with reason: `FAILED` / `DUPLICATE`), date range actually covered, counts
+      (REQ-RPT-001).
 
-### 9. API surface
-- [x] `GET /batches/{batch_id}`: add a `statements` array — `{id, bank, account_type,
-      account_identifier_masked, validation_result, extraction_status}` — so History/Review
-      (#9) have the per-statement trust signal. `POST /batches` response unchanged.
+#### B2. Analytics — `app/services/analytics.py`
+- [ ] `cash_flow(txns, *, period="month")` — per-period credits / debits / net, in cents.
+- [ ] `spending_by_category(txns)` — debit totals grouped by `category` (`None` →
+      `"Uncategorized"`).
+- [ ] `merchant_totals(txns, *, limit=10)` — top debit merchants by total, grouped on
+      `description_normalized`.
+- [ ] `recurring_charges(txns)` — group debits by `description_normalized`; for groups of ≥ 3,
+      detect a regular cadence (weekly / biweekly / monthly / annual, within a tolerance) and a
+      similar amount (within a small % band, REQ-ANLY-002); return
+      `{merchant, cadence, typical_amount_cents, occurrences, last_seen}`.
+- [ ] `trends(txns)` — current period vs previous: spending and net cash-flow deltas, as
+      `Decimal` ratios rendered to strings.
+- [ ] `build_analytics(session, *, start, end) -> Analytics` — assembles all of the above plus
+      `coverage`. Pure functions; `Decimal` for every ratio, integer cents for every amount;
+      never calls anything in `app/parsers` or an LLM.
 
-### 10. Tests (coverage stays ≥ 90%; NFR-MAINT-001/002)
-- [x] `test_detection.py`: synthetic Santander page → `confidence ≥ 0.70` with the right key;
-      a non-Santander page → below threshold; empty/garbage text → below threshold.
-- [x] `test_santander_checking_v1.py`: golden parse of the committed synthetic PDF → exact
-      expected transaction count, dates, amounts (cents), directions, opening/closing balances.
-- [x] `test_santander_local_golden.py`: parametrized over
-      `tests/fixtures/statements/local/*.pdf`, `skipif` none present — your real golden test.
-- [x] `test_normalization.py`: parsed → rows; **account reuse** (two statements, same masked
-      account → one `Account`); **account separation** (same bank, different masked digits →
-      two `Account` rows, REQ-ACC-002); full account number never stored; `SubCentPrecisionError`
-      surfaces.
-- [x] `test_financial_validation.py` (NFR-MAINT-002): balanced statement → `VALID`;
-      one debit removed → reconciliation `FAILED`; a transaction dated outside the period →
-      `WARNING`; a missing closing balance → structural `FAILED`.
-- [x] extend `test_job_queue.py`: clean PDF → job `COMPLETED`, `statement_id` set, one
-      `Statement` + N `Transaction` rows, `validation_result == "VALID"`; low-confidence detection
-      → job `UNSUPPORTED`, **zero `Statement` rows** (REQ-VAL-005); `ParserError` → job `FAILED`,
-      zero `Statement` rows; unbalanced statement → job `COMPLETED` but batch
-      `COMPLETED_WITH_WARNINGS`.
-- [x] extend `test_batches_api.py`: `GET /batches/{id}` shows the produced statement and its
-      `validation_result`.
-- [x] Name tests with REQ IDs where natural (`test_req_det_002_*`, `test_req_val_001_*`, …).
+#### B3. Endpoint
+- [ ] `GET /analytics?start=&end=` → the `Analytics` Pydantic model. `main.py` wires the router.
+- [ ] Works with an empty ledger (returns zeros / empty lists, `coverage` reflecting nothing
+      processed) — no 500.
 
-### 11. Checks
-- [x] `uv run pytest` (coverage gate), `uv run ruff check .`, `uv run ruff format --check .`.
-- [x] Full manual pass of `docs/manual-verification-santander.md` (happy path, UNSUPPORTED,
-      reconciliation FAILED, multi-file isolation, account resolution, privacy/traceability).
+#### B4. Tests — `tests/test_analytics.py`, `tests/test_ledger.py`
+- [ ] Ledger excludes `DUPLICATE` transactions, `DUPLICATE` statements, and `FAILED`
+      statements; includes `WARNING` and `POSSIBLE_DUPLICATE`.
+- [ ] Cash flow / merchant totals / spending-by-category on a hand-built set of transactions →
+      exact expected cents.
+- [ ] Recurring: 4 monthly charges to "NETFLIX" at `15.99, 15.99, 16.49, 16.49` → detected as
+      monthly recurring with a typical amount (build-plan #7 explicitly asks for the
+      slightly-varying-amount case).
+- [ ] Recurring: 3 charges to one merchant at random intervals → **not** flagged recurring.
+- [ ] Trends: two periods with known totals → correct delta strings.
+- [ ] `coverage_summary` lists an excluded `FAILED` statement with its reason.
+- [ ] `GET /analytics` end to end via `TestClient` on a small seeded ledger; empty-ledger case.
 
-### 12. Docs
-- [x] `docs/activity.md` entry (append).
-- [x] `README.md` "Status" / "Next up".
-- [x] Update `requirements.md` §20 open item (first institution chosen) and §5/§8 if the
-      detection threshold or tolerance should be recorded as spec — with your sign-off, since
-      `requirements.md` edits need approval.
+### C. Checks & docs
+- [ ] `uv run pytest` (coverage gate ≥ 90), `uv run ruff check .`, `uv run ruff format --check .`.
+- [ ] Manual: process two batches where batch 2 re-uploads a statement from batch 1 →
+      `GET /analytics` totals are identical to batch 1 alone (the re-upload didn't double
+      anything); `GET /review/duplicates` shows nothing for an exact re-upload.
+- [ ] `docs/activity.md` entry (append); `README.md` Status / Next up.
+- [ ] `tasks/todo.md` Review section.
 
 ## Review
 
-### What was completed
+### Part A — Deduplication (this PR)
 
-All 12 task groups. `app/parsers/` (base/registry/`santander_checking_v1`), three new
-services (`detection`, `normalization`, `financial_validation`), migration `69a3cd180f72`
-(`StatementJob.statement_id` FK + `uq_account_identity`), the rewritten `process_job` flow,
-the coordinator's validation-aware downgrade, and the `statements` array on
-`GET /batches/{id}`.
+**Completed:** model + migration `6518b8bf3cfe`, `app/services/deduplication.py`, the
+`refresh_batch` hook, `GET /batches/{id}` additions, the new `GET /review/duplicates`
+(`app/api/review.py`), and `APP_DATABASE_URL` in `app/db.py`.
 
-The first parser was tuned against the 12 real Santander statements the user provided, then a
-synthetic look-alike fixture built for CI.
+**Deviations from the plan:**
+- **`Statement.created_at` added too** — `Statement` had no timestamp, and dedup needs to pick
+  the *older* statement as canonical. Folded into the same migration.
+- **Migration disables SQLite FK enforcement around the batch rebuild** (`PRAGMA
+  foreign_keys=OFF`). `batch_alter_table` rebuilds `statement` / `transaction`, and the
+  `DROP TABLE` step trips FK enforcement when the db has rows. Tested on a fresh db and a
+  seeded one. `alembic/env.py` was tried as the place for this but the PRAGMA there silently
+  makes `batch_alter_table` a no-op — reverted, done in the migration instead.
+- **`dedup_statement` returns `None`, not a `DedupOutcome` dataclass** — the plan named a
+  return type that nothing consumed; the functions mutate rows and `run_dedup_for_batch`
+  orchestrates. Simpler.
+- **No user-facing merge/keep action** and dedup **does not change batch status** — a
+  re-uploaded duplicate is expected, not a warning.
 
-### Deviations from the plan
+**Tests:** `uv run pytest` — **105 passed, 96% coverage** (gate 90). `ruff` clean. New:
+`test_deduplication.py` (7), `test_review_api.py` (2), one `test_batches_api.py` two-batch
+worker-path case.
 
-- **Synthetic fixture location.** `tests/_santander_sample.py` (a Python builder), not
-  `tests/fixtures/statements/santander_checking_v1.py`. Matches the existing `tests/_pdf.py`
-  convention and sidesteps the repo-wide `*.pdf` ignore rule. `tests/_pdf.py` gained
-  `build_positioned_pdf()` to place tokens at absolute (x, y).
-- **Direction comes from the amount's column x-position**, cross-checked against the
-  running-balance delta — not from section headers (the real statements interleave credits and
-  debits in one "Account Activity" table, not separate deposit/withdrawal sections).
-- **Parser scope: checking only.** The real PDFs are combined checking + savings statements;
-  the savings section is deliberately not parsed (documented in the module). One job → one
-  `Statement`.
-- **`test_financial_validation` structural case** is `start_date > end_date → FAILED`, not
-  "missing closing balance" — the balance columns are `NOT NULL`, so they can't be missing.
-- **conftest fixture change.** `queued_job` / `intake_file` now use the Santander sample so
-  the happy path produces a real `Statement`; `native_pdf_path` stays generic and is now the
-  `UNSUPPORTED` case. Two pre-existing job/API tests updated accordingly.
-- **`normalize` converts all amounts to cents before any DB write**, so a
-  `SubCentPrecisionError` leaves nothing half-written (the plan implied a straight-through
-  loop).
+**Known / follow-ups:**
+- Live-server manual E2E for dedup not run — dev `data/app.db` is locked by an open DB
+  Browser. The two-batch worker test covers the same path.
+- The `min(created_at, id)` canonical-picker only matters when several existing statements
+  match at once (rare); for a plain re-upload the one prior statement is unambiguous.
 
-### Tests performed
+### Part B — Analytics engine (follow-up PR, branch `feature/analytics-engine` off updated main)
 
-`uv run pytest` — **95 passed, 96% coverage** (gate 90%). `ruff check` / `ruff format --check`
-clean. `test_santander_local_golden.py` — **12 passed** against the real PDFs locally
-(skips in CI). Manual end-to-end against a live uvicorn server: two real Santander PDFs + a
-`.txt` → both jobs `COMPLETED` (`NATIVE`), two `Statement` rows `VALID`, one resolved
-`Account` (both statements are the same account), 245 `Transaction` rows, batch
-`COMPLETED_WITH_WARNINGS`; a DB grep for the real full account number confirmed it is stored
-nowhere — only the masked last 4.
-
-### Known issues / follow-ups
-
-- `apps/backend/src/app/workers/pool.py` still has the pre-existing uncovered defensive
-  branches (build-plan #5's known gap) — total coverage unaffected.
-- The two OCR extraction tests still need `C:\Program Files\Tesseract-OCR` on PATH locally
-  (build-plan #4 quirk; CI installs it).
-- Raw PDF deletion after processing (REQ-CLEAN-001) is still not wired — not in #6 scope.
-- `requirements.md` §5/§8 could record the 0.70 detection threshold and the 0-cent
-  reconciliation tolerance as spec; left for a docs pass with the user's sign-off.
-
-### Recommended next step
-
-Merge this branch's PR, then build-plan #7 — deduplication + the deterministic analytics
-engine, the first consumer of the now-populated canonical ledger.
+_(filled in when Part B is done)_
