@@ -53,6 +53,29 @@ def _date_filters(start: date | None, end: date | None):
     return filters
 
 
+def _trusted_statement_ids():
+    """Statements whose transactions are trusted: not a duplicate re-upload, and
+    validated VALID/WARNING (a FAILED or not-yet-validated one is out)."""
+    return select(Statement.id).where(
+        col(Statement.dedup_status) != "DUPLICATE",
+        col(Statement.validation_result).in_(_LEDGER_VALIDATION),
+    )
+
+
+def ledger_query(*, include_duplicates: bool = False):
+    """The base ``select(Transaction)`` for the deduplicated, validated ledger --
+    a starting point other queries refine with more filters, ordering, and
+    pagination. ``include_duplicates`` keeps transaction rows marked
+    ``DUPLICATE`` (still on an otherwise-trusted statement) for a
+    "show me what I collapsed" view."""
+    query = select(Transaction).where(
+        col(Transaction.statement_id).in_(_trusted_statement_ids())
+    )
+    if not include_duplicates:
+        query = query.where(col(Transaction.dedup_status) != "DUPLICATE")
+    return query
+
+
 def ledger_transactions(
     session: Session, *, start: date | None = None, end: date | None = None
 ) -> list[Transaction]:
@@ -61,14 +84,8 @@ def ledger_transactions(
     ``start`` / ``end`` (inclusive) optionally clip to a ``transaction_date``
     window.
     """
-    statement = select(Statement.id).where(
-        col(Statement.dedup_status) != "DUPLICATE",
-        col(Statement.validation_result).in_(_LEDGER_VALIDATION),
-    )
     query = (
-        select(Transaction)
-        .where(col(Transaction.dedup_status) != "DUPLICATE")
-        .where(col(Transaction.statement_id).in_(statement))
+        ledger_query()
         .where(*_date_filters(start, end))
         .order_by(col(Transaction.transaction_date), col(Transaction.id))
     )

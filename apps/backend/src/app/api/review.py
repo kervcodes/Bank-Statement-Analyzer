@@ -1,16 +1,18 @@
 """The data behind the Review inbox (design-notes.md §3.4).
 
-Two lanes so far: possible-duplicate transactions the dedup pass could not
+Two read lanes: possible-duplicate transactions the dedup pass could not
 confidently collapse (build-plan #7), and transactions the categorizer routed to
-Review because nothing cleared the confidence gate (build-plan #8). The
-confirm / keep-both actions come with the Review UI (build-plan #9); the write
-paths for categories are `PUT /transactions/{id}/category` and
-`PUT /category-rules`.
+Review because nothing cleared the confidence gate (build-plan #8). Plus one
+write action for the first lane -- `POST /review/duplicates/{id}` with
+`keep_both` (the two transactions are both real) or `confirm` (it is a
+duplicate). Category corrections go through `PUT /transactions/{id}/category`
+(one row) or `PUT /category-rules` (merchant-wide, explicit).
 """
 
 from collections import defaultdict
+from typing import Literal
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlmodel import Session, col, select
 
@@ -84,6 +86,58 @@ def get_possible_duplicates(
         )
 
     return DuplicatesResponse(possible_duplicates=out)
+
+
+class DuplicateAction(BaseModel):
+    action: Literal["keep_both", "confirm"]
+
+
+class DuplicateActionResponse(BaseModel):
+    id: str
+    dedup_status: str
+
+
+@router.post("/duplicates/{transaction_id}", response_model=DuplicateActionResponse)
+def resolve_possible_duplicate(
+    transaction_id: str,
+    body: DuplicateAction,
+    session: Session = Depends(get_db_session),  # noqa: B008
+) -> DuplicateActionResponse:
+    """Act on one flagged possible-duplicate transaction. Never deletes the row.
+
+    - ``keep_both`` -> ``UNIQUE`` (both transactions are legitimate).
+    - ``confirm``   -> ``DUPLICATE`` (kept for traceability, excluded from
+      analytics).
+
+    Safe to re-run: calling an action on a transaction already in its target
+    state is a no-op. Any other current state is a 409.
+    """
+    txn = session.get(Transaction, transaction_id)
+    if txn is None:
+        raise HTTPException(status_code=404, detail="transaction not found")
+
+    target = "UNIQUE" if body.action == "keep_both" else "DUPLICATE"
+
+    if txn.dedup_status not in ("POSSIBLE_DUPLICATE", target):
+        raise HTTPException(
+            status_code=409,
+            detail=f"transaction is {txn.dedup_status}, not a possible duplicate",
+        )
+    if body.action == "confirm" and txn.duplicate_of_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail="nothing recorded for this transaction to be a duplicate of",
+        )
+
+    if txn.dedup_status != target:
+        txn.dedup_status = target
+        if body.action == "keep_both":
+            txn.duplicate_of_id = None
+        session.add(txn)
+        session.commit()
+        session.refresh(txn)
+
+    return DuplicateActionResponse(id=txn.id, dedup_status=txn.dedup_status)
 
 
 class UncategorizedGroup(BaseModel):

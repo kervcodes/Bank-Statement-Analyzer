@@ -1,98 +1,170 @@
-# Todo: recover stuck/orphaned processing jobs
+# Todo: Build-plan #9 — PR 2 (Dashboard + Review + transaction drawer)
 
-Branch `fix/stale-processing-jobs` off `main`, independent of `fix/auto-migrate-on-startup`
-(that branch's work is stashed on its own branch, untouched by this one).
+Branch `feature/dashboard-review` off `main` (PR #15 merged). Source: `build-plan.md` §9,
+`design-notes.md` §3.1 / §3.4 / §3.6, §4–§6.
 
-## Problem
+## Scope (strict — from the owner)
 
-Reported: batch `7af8bba1` has sat at "Processing", 0/6, since 2026-09-09 with no way to act
-on it. Confirmed in the dev DB: all 6 `statement_job` rows are `PROCESSING`, `attempt_count: 0`,
-`updated_at` staggered ~1.7s apart (consistent with the backend being restarted/crashing
-repeatedly, each restart claiming the next queued job before dying again) — none ever reached a
-terminal status.
+**In:** Dashboard, Review, transaction drawer, `GET /transactions/{id}`, filtered/paginated
+`GET /transactions`, duplicate review actions.
+**Out (PR 3):** Accounts, Settings, Electron `safeStorage`, `GET /accounts`. Do not pull any of
+these forward.
 
-**Root cause:** `CLAIMABLE_JOB_STATUSES = ("QUEUED", "RETRYING")` (`models/jobs.py:31`) does not
-include `PROCESSING`. If the backend process dies or restarts while a job is claimed (crash, a
-hung OCR call in the single-threaded worker — `services/extraction.py` has no timeout around
-`pdfplumber`/`poppler`/`tesseract`), that job is permanently excluded from being claimed again.
-`refresh_batch` never sees all-terminal, so the batch stays `PROCESSING` forever. There is also
-no API to inspect or act on this — `api/batches.py` has no retry/cancel endpoint.
+## Locked decisions carried from the #9 plan
 
-**Out of scope (documented, not built):** a hard timeout around OCR extraction. Doing that
-properly needs process isolation, which conflicts with the existing intentional single-thread
-design in `pool.py` (see its module docstring) — bigger change than this bug needs today.
+- Dashboard default range = **last 12 months**; a date-range control is present.
+- Charts = **Recharts**; every financial value must also be reachable as a number / table, not
+  only in a chart (run the `dataviz` skill before writing chart code).
+- Duplicate actions: `keep_both` → `UNIQUE`, `confirm` → `DUPLICATE`. No undo UI; both
+  re-runnable; **never delete the row**; a confirmed duplicate stays queryable but is excluded
+  from analytics. **No migration** — the existing `dedup_status` / `duplicate_of_id` columns
+  are enough.
+- Pagination on every list endpoint. State boundaries: TanStack Query = server; local React
+  state = UI-only; router search params = navigation + filter state. No Redux/Zustand.
+- Foundation stays minimal.
 
-## Design (owner-approved: startup recovery + a manual retry endpoint)
+## Backend
 
-Shared helper `reclaim_processing_jobs(session, *, batch_id=None, min_age_seconds=None)` in
-`app/workers/queue.py`:
-- Selects `PROCESSING` jobs (optionally scoped to one batch, optionally only those whose
-  `updated_at` is older than `min_age_seconds`).
-- For each: `attempt_count += 1`; status -> `RETRYING` if `attempt_count < max_attempts` else
-  `FAILED`; `failure_reason` records that it was interrupted, not why the job itself failed.
-- Returns the count reclaimed. Caller commits and calls `refresh_batch` for affected batch ids
-  (a job reclaimed straight to `FAILED` can make the batch newly terminal).
+### B1. `GET /transactions/{id}` — the drawer's data (`app/api/transactions.py`)
+- Join Transaction → Statement → Account. Response: `id`, `transaction_date`, `posted_date`,
+  `amount_cents`, `direction`, `category`, `category_source`, `predicted_category`,
+  `user_category`, `merchant_normalized`, `description_normalized`, `description_raw`,
+  `dedup_status`, and a **`source`** block that is always present (`statement_id`, `bank`,
+  `account_type`, `account_identifier_masked`, `statement_period` (start/end), `source_page`,
+  `parser_version`) — REQ-RPT-003 traceability. 404 on unknown id.
+- Tests: full shape for a real txn; 404.
 
-Two callers:
-1. **Startup recovery** — `main.py` lifespan, before `worker.start()`. No worker is running yet,
-   so every `PROCESSING` row is guaranteed orphaned: `reclaim_processing_jobs(session)`, no age
-   filter, all batches.
-2. **Manual retry** — `POST /batches/{batch_id}/retry`. The worker *may* be actively running here,
-   so only reclaim jobs stale for >= 60s (`min_age_seconds=60`) to avoid racing a job that is
-   legitimately mid-flight. If the batch isn't `PROCESSING`, or nothing was stale enough to
-   reclaim, return 409 with a clear reason. On success, return the reclaimed count and refreshed
-   batch status.
+### B2. `GET /transactions` — filtered, paginated list (`app/api/transactions.py`)
+- Query: `category`, `merchant` (exact match on `merchant_normalized`), `account_id`,
+  `batch_id`, `date_from`, `date_to` (inclusive, on `transaction_date`), `page` (≥1),
+  `page_size` (1–100, default 50), `sort` (`date_desc` default / `date_asc` / `amount_desc` /
+  `amount_asc`), and `include_duplicates` (default `false`).
+- Default view = the **deduplicated, validated ledger** (same rule as `app/services/ledger.py`
+  — not `DUPLICATE`, statement not `DUPLICATE`/`FAILED`), so a Dashboard drill-through shows
+  exactly the rows behind the number. `include_duplicates=true` widens it to every row
+  (Review's "show me the confirmed duplicates" case).
+- Response `{items, page, page_size, total}`. Each item: `id`, `transaction_date`,
+  `merchant` (`merchant_normalized or description_normalized`), `description_normalized`,
+  `amount_cents`, `direction`, `category`, `category_source`, `bank`,
+  `account_identifier_masked`, `dedup_status`.
+- Reuse the ledger filter helper from `app/services/ledger.py` where practical rather than
+  re-deriving it.
+- Tests: each filter narrows correctly; sort order; pagination; `include_duplicates`; empty →
+  `{items: [], total: 0}`.
 
-## Tasks
+### B3. `POST /review/duplicates/{transaction_id}` — the duplicate action (`app/api/review.py`)
+- Body `{action: "keep_both" | "confirm"}`.
+- Preconditions: the txn is currently `POSSIBLE_DUPLICATE`, **or** already in the action's
+  target state (so the call is safe to re-run). Otherwise 409.
+  - `keep_both` → `dedup_status = "UNIQUE"`, `duplicate_of_id = None`.
+  - `confirm` → `dedup_status = "DUPLICATE"` (keeps `duplicate_of_id`); 409 if there is no
+    `duplicate_of_id` to point at.
+- No re-run of dedup or validation; analytics reflects the change on its next read.
+- Returns the txn's new `dedup_status`.
+- Tests: `keep_both` and `confirm` from `POSSIBLE_DUPLICATE`; re-running each is a no-op 200;
+  `confirm` with no match → 409; a `DUPLICATE` txn excluded from `GET /transactions` default
+  but present with `include_duplicates=true`; analytics total drops after `confirm`.
 
-- [x] C1. `reclaim_processing_jobs()` in `app/workers/queue.py`.
-- [x] C2. Wire startup recovery into `main.py` lifespan, before `worker.start()`.
-- [x] C3. `POST /batches/{batch_id}/retry` in `api/batches.py` (404 unknown batch, 409 nothing
-      stale/not PROCESSING, 200 with reclaimed count + batch status on success).
-- [x] C4. Tests (`test_job_queue.py` / `test_batches_api.py` / `test_main.py`):
-  - fresh restart with orphaned `PROCESSING` rows -> all reclaimed regardless of age
-  - a job already at `max_attempts` -> reclaimed straight to `FAILED`, batch re-evaluated
-  - retry endpoint: stale (>60s) `PROCESSING` job -> reclaimed, 200
-  - retry endpoint: recent (<60s) `PROCESSING` job -> left alone, 409
-  - retry endpoint: batch not in `PROCESSING` -> 409
-  - retry endpoint: unknown batch id -> 404
-  - lifespan wiring test (`get_session` + worker stubbed, never touches the real DB/thread)
-- [x] C5. Docs: `docs/activity.md` entry; noted the OCR-timeout follow-up as a known limitation
-      (not building it now).
-- [x] C6. Unblock batch `7af8bba1` for real — verified against a **copy** of the real dev DB
-      (`apps/backend/data/app.db`, copied to scratch, never mutated): all 6 jobs reclaimed on
-      startup, reprocessed by the real worker against the real source PDFs (still on disk),
-      batch ended `COMPLETED`, 6/6 processed, 0 failed. Scratch copy deleted after verification.
-      The real `app.db` itself is untouched — merging this branch and restarting the real
-      backend will apply the same fix to it.
+## Frontend (`apps/desktop`)
+
+### F0. Primitives
+- Add `@radix-ui/react-dialog` (focus trap + Esc, for the drawer/sheet — design-notes
+  §accessibility). Hand-vendor a minimal `Sheet` (right-side panel + overlay) and a `Select`
+  (category picker) on top of it, or a tiny native `<select>` if that's enough.
+- Extend `lib/api.ts` with the three new calls + query keys; `lib/format.ts` with
+  `formatCents` (already implied) and a `categorySourceLabel`.
+
+### F1. Transaction drawer (`components/TransactionDrawer.tsx`, design-notes §3.6)
+- Opened via a `?txn=<id>` search param (linkable). `GET /transactions/{id}`.
+- Merchant, `-$X · date`, category with `[edit]` → a `Select` of the fixed taxonomy →
+  `PUT /transactions/{id}/category` (per-transaction override), account line, the **Source**
+  block (always shown), raw text.
+- Invalidates `['transactions']` + `['analytics']` on a category change.
+
+### F2. Transaction list sheet (`components/TransactionListSheet.tsx`)
+- A wider sheet holding a compact table, backed by `GET /transactions` with filters from its
+  own props (category / merchant / date window / batch). Page controls. A row opens the F1
+  drawer. This is the "click a number → see the rows" surface (§principle 4).
+
+### F3. Dashboard (`routes/DashboardRoute.tsx`, design-notes §3.1)
+- Date-range control top-right (`Last 12 months` default / `This year` / `All time` / custom)
+  → writes `start` / `end` to the URL; the charts and lists below read them.
+- **Coverage bar**, pinned above everything: from `analytics.coverage`. Green pill when
+  `statements_excluded === 0`; amber + an expandable excluded list otherwise; the bar links to
+  `/history`.
+- **Stat cards**: net cash flow, spending, top category — `tabular` figures.
+  - **Spending card = the latest _full calendar month_** (the current partial month is
+    excluded), with a percentage delta vs the **previous full calendar month**. Label makes
+    that explicit, e.g. "August spending — $4,210  ↓ 3% vs July". Not the selected-range total,
+    not an average.
+  - If there are **fewer than two complete months** of data: show the latest full month with
+    **no delta** and a neutral "Not enough prior data" note.
+  - Clicking the Spending card drills F2 to **exactly that month's spending transactions**
+    (the same `date_from`/`date_to` + spending-category filter that produced the number).
+  - The other cards use the `trends` delta where available. Clicking one opens F2 filtered.
+- **Charts** (Recharts, after the `dataviz` skill): a 12-month cash-flow chart
+  (credits / debits / net, transfers shown distinctly) and a spending-by-category donut. Each
+  has a **"show as table"** toggle rendering the same numbers as an accessible `<table>`.
+  Clicking a category segment opens F2 filtered to that category.
+- **Recurring charges** + **Top merchants** lists (already numeric/tabular; a merchant row
+  opens F2).
+- **AI summary panel** — `GET /analytics/explanation`, its own labelled card with the provider
+  tag + a Refresh button (refetch). `provider === null` → "Add an API key in Settings to get a
+  plain-English summary" empty state. Never blended with the figures (§principle 2).
+- Empty ledger → a "nothing processed yet, import statements" state, not zeroed charts
+  (§empty states).
+
+### F4. Review (`routes/ReviewRoute.tsx`, design-notes §3.4)
+- One page, sections in order, each with a count; the sidebar badge = the sum.
+- **Possible duplicates** — `GET /review/duplicates`; each pair shows both rows; `[Keep both]`
+  → `POST /review/duplicates/{id}` `{keep_both}`, `[This is a duplicate]` → `{confirm}`.
+  Invalidate `['review']` + `['analytics']`.
+- **Needs a category** — `GET /review/categorizations` (grouped by merchant). **The category
+  action must make its scope explicit before writing** (owner correction):
+  - A **merchant-wide** action is presented as explicit intent — the button literally reads
+    "Always categorize <merchant> as <category>" → `PUT /category-rules` (affects every
+    non-overridden transaction of that merchant, now and future).
+  - A generic "Categorize" that silently becomes a rule is **not allowed**. If the user wants
+    to fix only some rows, they expand the group and edit per transaction →
+    `PUT /transactions/{id}/category` (that row only).
+  - Precedence invariant unchanged: `USER OVERRIDE → MERCHANT RULE → prediction ≥ 0.75 →
+    Review`.
+  - Invalidate `['review']` + `['analytics']` + `['transactions']`.
+- **Failed / unsupported statements** — a read-only summary derived from `GET /batches`
+  (batches with `processing_failed > 0`), linking to History for the retry/re-upload. (A
+  first-class `GET /review/statements` endpoint + retry action is a later PR — not in scope
+  here.)
+
+### F5. Tests (Vitest + RTL + MSW)
+- `lib`: the date-range → `start`/`end` helper.
+- `TransactionDrawer`: renders the source block, category edit posts and closes.
+- `TransactionListSheet`: filters passed through to the request; row opens the drawer.
+- `DashboardRoute`: coverage bar green vs amber; AI panel empty state vs text; a chart's
+  "show as table" toggle; empty-ledger state.
+- `ReviewRoute`: `keep_both` / `confirm` hit the right endpoint+body and refetch; a category
+  confirm writes a merchant rule.
+
+### F6. Checks & docs
+- `pnpm lint` / `pnpm typecheck` / `pnpm test:run` / `pnpm build`; backend `uv run pytest` /
+  `ruff`.
+- `docs/activity.md`; `README.md`; `docs/manual-verification-frontend-pr2.md`.
+- `tasks/todo.md` Review.
+
+## Suggested build order
+
+B1 → B2 → B3 (backend, each with tests) → F0 → F1 + F2 (drawer + list, the shared drill-through
+surface) → F3 (Dashboard) → F4 (Review) → F5/F6.
+
+## Owner corrections recorded (2026-09-08)
+
+- **Spending stat card** = latest *full calendar month* vs previous full calendar month;
+  exclude the current partial month; `<2` full months → latest month, no delta, "Not enough
+  prior data"; explicit label; click drills to that month's spending transactions. Not an
+  average, not the range total. (F3.)
+- **Review category action** never silently becomes a merchant rule — the merchant-wide button
+  states the scope explicitly; per-transaction fixes go through `PUT /transactions/{id}/category`.
+  (F4.)
 
 ## Review
 
-**Done:** `reclaim_processing_jobs()` in `app/workers/queue.py`, called (a) from `main.py`'s
-lifespan before `worker.start()` with no filters — nothing is running yet, so every
-`PROCESSING` row is guaranteed orphaned — and (b) from the new `POST /batches/{batch_id}/retry`
-in `api/batches.py`, gated to jobs stale 60s+ so it can't race a job the worker is legitimately
-still on.
-
-**Flow:** reclaim increments `attempt_count` like any other failed attempt (so a job that keeps
-getting orphaned still terminates at `FAILED` after `max_attempts`, never loops forever),
-flips it to `RETRYING`, and lets the existing worker/coordinator machinery take it from there —
-no new job-processing path.
-
-**Tests:** 8 new (4 in `test_job_queue.py` for `reclaim_processing_jobs()` itself, 3 in
-`test_batches_api.py` for the retry endpoint's 404/409/200 paths, 1 in `test_main.py` for the
-lifespan wiring). 233 backend tests pass, 97.6% coverage, ruff clean.
-
-**Verified against real data:** dry run on a scratch copy of the actual dev DB (never mutated
-the real file) reclaimed batch `7af8bba1`'s 6 orphaned jobs and reprocessed them end to end via
-the real worker against the real source PDFs — batch went `PROCESSING` -> `COMPLETED`, 6/6,
-0 failed.
-
-**Known follow-up (documented, not in scope):** no execution timeout around OCR extraction
-(`services/extraction.py`). A hung `pytesseract`/`poppler` call would still block the
-single-threaded worker indefinitely; a proper fix needs process isolation, which conflicts with
-`pool.py`'s existing intentional single-thread design.
-
-**Recommended next step:** owner review (branch `fix/stale-processing-jobs`), then merge to
-`main`; restarting the real backend after merge applies the startup recovery to the actual
-`app.db` and unsticks batch `7af8bba1` for real.
+_(filled in when PR 2 is done)_
