@@ -10,6 +10,8 @@ from sqlmodel import (
     UniqueConstraint,
 )
 
+from app.models.taxonomy import category_in_sql
+
 if TYPE_CHECKING:
     from app.models.intake import IntakeFile
 
@@ -23,6 +25,11 @@ DIRECTIONS = ("DEBIT", "CREDIT")
 # DUPLICATE = auto-collapsed, excluded from the ledger. POSSIBLE_DUPLICATE =
 # ambiguous, kept and flagged for Review (REQ-DEDUP-004: never a silent delete).
 DEDUP_STATUSES = ("UNIQUE", "DUPLICATE", "POSSIBLE_DUPLICATE")
+# Categorization (build-plan #8). `predicted_source` is how the automated guess
+# was made; `category_source` is how the *effective* `category` was decided,
+# resolved USER -> MERCHANT_RULE -> prediction -> NONE (routed to Review).
+PREDICTED_SOURCES = ("RULE", "LLM", "NONE")
+CATEGORY_SOURCES = ("USER", "MERCHANT_RULE", "RULE", "LLM", "NONE")
 
 
 def _in_list(column: str, values: tuple[str, ...]) -> str:
@@ -171,6 +178,23 @@ class Transaction(SQLModel, table=True):
             _in_list("dedup_status", DEDUP_STATUSES),
             name="ck_transaction_dedup_status",
         ),
+        CheckConstraint(category_in_sql("category"), name="ck_transaction_category"),
+        CheckConstraint(
+            "predicted_category IS NULL OR " + category_in_sql("predicted_category"),
+            name="ck_transaction_predicted_category",
+        ),
+        CheckConstraint(
+            "user_category IS NULL OR " + category_in_sql("user_category"),
+            name="ck_transaction_user_category",
+        ),
+        CheckConstraint(
+            _in_list("predicted_source", PREDICTED_SOURCES),
+            name="ck_transaction_predicted_source",
+        ),
+        CheckConstraint(
+            _in_list("category_source", CATEGORY_SOURCES),
+            name="ck_transaction_category_source",
+        ),
     )
 
     id: str = Field(default_factory=_uuid, primary_key=True)
@@ -183,10 +207,23 @@ class Transaction(SQLModel, table=True):
     amount_cents: int
     direction: str
     balance_after_cents: int | None = None
-    category: str | None = None
     source_bank: str
     extraction_confidence: float | None = None
     source_page: int
+    # Categorization (build-plan #8). `merchant_normalized` is the cleaned
+    # merchant name rules and the LLM both operate on (REQ-CAT-002).
+    merchant_normalized: str | None = Field(default=None, index=True)
+    # The automated guess, kept even after a user or merchant-rule override so
+    # deleting the override restores it (non-destructive, REQ-CAT-004).
+    predicted_category: str | None = None
+    predicted_confidence: float | None = None
+    predicted_source: str = "NONE"
+    # A per-transaction user override. Beats everything else.
+    user_category: str | None = None
+    # The effective category, resolved from the above. Materialized so analytics
+    # and the ledger keep grouping on one column.
+    category: str = "Uncategorized"
+    category_source: str = "NONE"
     # A statement-provided reference / confirmation number, when the parser
     # extracts one (REQ-DEDUP-002). None for santander_checking_v1 so far.
     reference_id: str | None = None

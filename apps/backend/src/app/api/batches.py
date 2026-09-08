@@ -63,6 +63,7 @@ class BatchStatusResponse(BaseModel):
     processed: int
     processing_failed: int
     possible_duplicate_count: int
+    uncategorized_count: int
     jobs: list[JobStatus]
     statements: list[StatementSummary]
 
@@ -206,6 +207,14 @@ def get_batch(
         .where(col(Transaction.dedup_status) == "POSSIBLE_DUPLICATE")
     ).one()
 
+    uncategorized = session.exec(
+        select(func.count())
+        .select_from(Transaction)
+        .join(Statement, col(Transaction.statement_id) == col(Statement.id))
+        .where(col(Statement.batch_id) == batch_id)
+        .where(col(Transaction.category_source) == "NONE")
+    ).one()
+
     return BatchStatusResponse(
         batch_id=batch.id,
         status=batch.status,
@@ -216,6 +225,7 @@ def get_batch(
         processed=batch.processed,
         processing_failed=batch.processing_failed,
         possible_duplicate_count=possible_duplicate_count,
+        uncategorized_count=uncategorized,
         jobs=[
             JobStatus(
                 id=j.id,

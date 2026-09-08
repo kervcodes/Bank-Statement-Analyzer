@@ -1,9 +1,14 @@
 """The data behind the Review inbox (design-notes.md §3.4).
 
-At build-plan #7 this exposes only the possible-duplicate transactions -- pairs
-the dedup pass could not confidently collapse. The keep-both / this-is-a-dup
-actions come with the Review UI (build-plan #9); this endpoint is read-only.
+Two lanes so far: possible-duplicate transactions the dedup pass could not
+confidently collapse (build-plan #7), and transactions the categorizer routed to
+Review because nothing cleared the confidence gate (build-plan #8). The
+confirm / keep-both actions come with the Review UI (build-plan #9); the write
+paths for categories are `PUT /transactions/{id}/category` and
+`PUT /category-rules`.
 """
+
+from collections import defaultdict
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
@@ -79,3 +84,48 @@ def get_possible_duplicates(
         )
 
     return DuplicatesResponse(possible_duplicates=out)
+
+
+class UncategorizedGroup(BaseModel):
+    merchant: str
+    transaction_count: int
+    total_cents: int
+    # the sub-threshold guess, if there was one — shown as "Suggested: X"
+    suggested_category: str | None
+    sample_description: str
+
+
+class UncategorizedResponse(BaseModel):
+    groups: list[UncategorizedGroup]
+
+
+@router.get("/categorizations", response_model=UncategorizedResponse)
+def get_uncategorized(
+    session: Session = Depends(get_db_session),  # noqa: B008
+) -> UncategorizedResponse:
+    """Transactions the categorizer could not confidently place, grouped by
+    merchant so the user confirms one category per merchant, not per row."""
+    rows = session.exec(
+        select(Transaction)
+        .where(col(Transaction.category_source) == "NONE")
+        .order_by(col(Transaction.merchant_normalized), col(Transaction.id))
+    ).all()
+
+    grouped: dict[str, list[Transaction]] = defaultdict(list)
+    for txn in rows:
+        grouped[txn.merchant_normalized or txn.description_normalized].append(txn)
+
+    groups = [
+        UncategorizedGroup(
+            merchant=merchant,
+            transaction_count=len(txns),
+            total_cents=sum(t.amount_cents for t in txns),
+            suggested_category=next(
+                (t.predicted_category for t in txns if t.predicted_category), None
+            ),
+            sample_description=txns[0].description_normalized,
+        )
+        for merchant, txns in grouped.items()
+    ]
+    groups.sort(key=lambda g: (-g.total_cents, g.merchant))
+    return UncategorizedResponse(groups=groups)

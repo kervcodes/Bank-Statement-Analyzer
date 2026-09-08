@@ -21,7 +21,7 @@ from itertools import pairwise
 from pydantic import BaseModel
 from sqlmodel import Session
 
-from app.models import Transaction
+from app.models import Transaction, category_type, is_spending_category
 from app.services.ledger import Coverage, coverage_summary, ledger_transactions
 
 # Recurring-charge detection (REQ-ANLY-002). A group of same-merchant debits is
@@ -44,6 +44,12 @@ def _period_key(day: date) -> str:
     return f"{day.year:04d}-{day.month:02d}"
 
 
+def _merchant(txn: Transaction) -> str:
+    """The merchant to aggregate on: the normalized name once build-plan #8 has
+    run, otherwise the lightly-cleaned description."""
+    return txn.merchant_normalized or txn.description_normalized.strip()
+
+
 def _ratio_str(numerator: int, denominator: int) -> str | None:
     """A signed ratio as a 4-dp string, or None when the base is zero."""
     if denominator == 0:
@@ -57,6 +63,12 @@ class PeriodCashFlow(BaseModel):
     credits_cents: int
     debits_cents: int
     net_cents: int
+    # Debits in a spending category (expense + Uncategorized) -- excludes moves
+    # between the user's own accounts and credit-card payments.
+    spending_cents: int
+    # Total volume categorized as a transfer, either direction. Surfaced so a
+    # checking<->savings move is visible rather than hidden inside net.
+    transfers_cents: int
 
 
 class CategoryTotal(BaseModel):
@@ -128,12 +140,18 @@ def cash_flow(
 
     credits: dict[str, int] = defaultdict(int)
     debits: dict[str, int] = defaultdict(int)
+    spending: dict[str, int] = defaultdict(int)
+    transfers: dict[str, int] = defaultdict(int)
     for txn in txns:
         key = _period_key(txn.transaction_date)
         if txn.direction == "CREDIT":
             credits[key] += txn.amount_cents
         else:
             debits[key] += txn.amount_cents
+            if is_spending_category(txn.category):
+                spending[key] += txn.amount_cents
+        if category_type(txn.category) == "transfer":
+            transfers[key] += txn.amount_cents
 
     return [
         PeriodCashFlow(
@@ -141,21 +159,23 @@ def cash_flow(
             credits_cents=credits[key],
             debits_cents=debits[key],
             net_cents=credits[key] - debits[key],
+            spending_cents=spending[key],
+            transfers_cents=transfers[key],
         )
         for key in sorted(credits.keys() | debits.keys())
     ]
 
 
 def spending_by_category(txns: list[Transaction]) -> list[CategoryTotal]:
-    """Debit totals grouped by ``category`` (``None`` -> ``"Uncategorized"``),
-    largest first. Categorization itself is build-plan #8; today this is almost
-    all one bucket."""
+    """Debit totals grouped by ``category``, largest first. Only spending
+    categories (expense + ``Uncategorized``) are counted -- income and transfers
+    are not spending, so a checking->savings move never lands here."""
     totals: dict[str, int] = defaultdict(int)
     counts: dict[str, int] = defaultdict(int)
     for txn in txns:
-        if txn.direction != "DEBIT":
+        if txn.direction != "DEBIT" or not is_spending_category(txn.category):
             continue
-        key = txn.category or "Uncategorized"
+        key = txn.category
         totals[key] += txn.amount_cents
         counts[key] += 1
 
@@ -168,15 +188,14 @@ def spending_by_category(txns: list[Transaction]) -> list[CategoryTotal]:
 
 
 def merchant_totals(txns: list[Transaction], *, limit: int = 10) -> list[MerchantTotal]:
-    """Top debit merchants by total spend, grouped on ``description_normalized``.
-    Real merchant normalization is build-plan #8; this groups on the light
-    whitespace-cleaned string as it stands."""
+    """Top merchants by spend, grouped on the normalized merchant. Spending
+    debits only -- transfers and credit-card payments are excluded."""
     totals: dict[str, int] = defaultdict(int)
     counts: dict[str, int] = defaultdict(int)
     for txn in txns:
-        if txn.direction != "DEBIT":
+        if txn.direction != "DEBIT" or not is_spending_category(txn.category):
             continue
-        key = txn.description_normalized.strip()
+        key = _merchant(txn)
         totals[key] += txn.amount_cents
         counts[key] += 1
 
@@ -213,9 +232,10 @@ def recurring_charges(txns: list[Transaction]) -> list[RecurringCharge]:
     for txn in txns:
         if txn.direction != "DEBIT":
             continue
-        key = txn.description_normalized.strip().casefold()
+        merchant = _merchant(txn)
+        key = merchant.casefold()
         groups[key].append(txn)
-        display.setdefault(key, txn.description_normalized.strip())
+        display.setdefault(key, merchant)
 
     out: list[RecurringCharge] = []
     for key, members in groups.items():
@@ -261,13 +281,13 @@ def trends(txns: list[Transaction]) -> Trends:
         )
 
     current, previous = flow[-1], flow[-2]
-    spending_delta = current.debits_cents - previous.debits_cents
+    spending_delta = current.spending_cents - previous.spending_cents
     net_delta = current.net_cents - previous.net_cents
     return Trends(
         current_period=current.period,
         previous_period=previous.period,
         spending_delta_cents=spending_delta,
-        spending_delta_ratio=_ratio_str(spending_delta, previous.debits_cents),
+        spending_delta_ratio=_ratio_str(spending_delta, previous.spending_cents),
         net_delta_cents=net_delta,
         net_delta_ratio=_ratio_str(net_delta, abs(previous.net_cents)),
     )

@@ -30,7 +30,8 @@ def _t(
     amount_cents: int,
     direction: str,
     desc: str = "SOMETHING",
-    category: str | None = None,
+    category: str = "Uncategorized",
+    merchant: str | None = None,
 ) -> Transaction:
     return Transaction(
         statement_id="stmt-1",
@@ -41,6 +42,7 @@ def _t(
         amount_cents=amount_cents,
         direction=direction,
         category=category,
+        merchant_normalized=merchant,
         source_bank="Santander",
         source_page=1,
     )
@@ -88,6 +90,41 @@ def test_merchant_totals_debits_only_ranked():
 
 def test_merchant_totals_respects_limit():
     assert len(merchant_totals(LEDGER, limit=1)) == 1
+
+
+def test_merchant_totals_aggregate_on_normalized_merchant():
+    # two different raw descriptions, one normalized merchant
+    txns = [
+        _t(
+            date(2026, 1, 3), 1_200, "DEBIT", "AMAZON.COM*A1 SEATTLE", merchant="Amazon"
+        ),
+        _t(date(2026, 1, 9), 800, "DEBIT", "AMZN MKTP US*B2", merchant="Amazon"),
+    ]
+    (row,) = merchant_totals(txns)
+    assert row.merchant == "Amazon"
+    assert row.total_cents == 2_000
+    assert row.transaction_count == 2
+
+
+def test_spending_excludes_transfers_and_income():
+    txns = [
+        _t(date(2026, 1, 5), 200_000, "DEBIT", "TO SAVINGS", category="Transfers"),
+        _t(date(2026, 1, 6), 4_000, "DEBIT", "CORNER STORE", category="Groceries"),
+        _t(
+            date(2026, 1, 7),
+            9_000,
+            "DEBIT",
+            "CHASE CARD",
+            category="Credit Card Payments",
+        ),
+    ]
+    cats = spending_by_category(txns)
+    assert [(c.category, c.total_cents) for c in cats] == [("Groceries", 4_000)]
+
+    (flow,) = cash_flow(txns)
+    assert flow.debits_cents == 213_000
+    assert flow.spending_cents == 4_000
+    assert flow.transfers_cents == 209_000
 
 
 def test_recurring_detects_monthly_with_drifting_amount():
@@ -247,6 +284,8 @@ def test_get_analytics_endpoint(client: TestClient, session: Session):
         "credits_cents": 200_000,
         "debits_cents": 5_000,
         "net_cents": 195_000,
+        "spending_cents": 5_000,
+        "transfers_cents": 0,
     }
 
 

@@ -756,3 +756,85 @@ exact path the manual check in `docs/manual-verification-analytics.md` describes
 
 **Next step:** build-plan.md #8 — categorization, the Privacy Gateway, and the LLM explanation
 layer.
+
+---
+
+## 2026-09-08 — Rule-based categorization + merchant normalization (build-plan #8, Part 1 of 2)
+
+**Prompt:** "Continue with the next step. Start a new branch as usual" → a detailed set of
+locked decisions from the owner on the categorization design (recorded in `tasks/todo.md` and
+memory `categorization-architecture`). Traces to `requirements.md` §11 (REQ-CAT-001..004).
+
+Build-plan #8 is split like #7: **Part 1 — deterministic categorization** (this PR, no
+network), **Part 2 — Privacy Gateway + `LLMProvider` + LLM-assisted categorization + dashboard
+explanation** (a follow-up). REQ-LLM-102 (the app works fully with no LLM key) means Part 1
+has to stand alone anyway.
+
+**The layered, non-destructive model** (owner's design):
+- `app/models/taxonomy.py` — the fixed v1 category list (22), each carrying an
+  `income` / `expense` / `transfer` **transaction type**. `is_spending_category()` — only
+  `expense` categories and un-triaged `Uncategorized` count as spending; income and transfers
+  never do, so a checking↔savings move can't show up as $2,000 of spending.
+- `Transaction` now stores the automated guess (`predicted_category` / `predicted_confidence`
+  / `predicted_source`) **separately** from a per-transaction `user_category` and from the
+  materialized effective `category` + `category_source`. Removing an override or a rule
+  restores the prediction with no bulk row rewrite.
+- New `CategoryRule` table — a user's explicit "always categorize [merchant] as X". Not written
+  by a plain single-transaction edit.
+- Migration `208f30aad50f` — hand-written `batch_alter_table` (backfills the pre-existing
+  nullable `category` to `Uncategorized`, PRAGMA FK-off around the rebuild). Verified fresh
+  (up/down/up) and seeded.
+
+**The resolution invariant** (`app/services/categorization.py::resolve_category`):
+`USER OVERRIDE → MERCHANT RULE → prediction (confidence ≥ 0.75) → Uncategorized (Review)`.
+`AUTO_ASSIGN_THRESHOLD = 0.75` is a named constant flagged for calibration against the 12 real
+statements, optimizing precision on auto-assigned.
+
+**Deterministic engine:**
+- `merchant_normalization.py` — `normalize_merchant("UBER *TRIP …")` and `"UBER TECHNOLOGIES"`
+  both → `"Uber"` (REQ-CAT-002). Strips processor prefixes / channel words / store & ref
+  numbers / state tags; a `ZELLE|VENMO TO <person>` line collapses to just the channel, so a
+  counterparty's name is dropped here (a first privacy layer, well before Part 2).
+- `categorization_rules.py` — built-in `MERCHANT_ALIASES`, `MERCHANT_CATEGORY`,
+  `KEYWORD_CATEGORY` **in code, not seeded rows** (a code edit + test beats a data migration
+  every time the list changes). Confidence constants (0.97 merchant / 0.78 keyword / 0.80
+  credit-default) are `_validate()`-checked against the taxonomy at import.
+- `predict_category` — exact merchant map → keyword scan → (Part-2 LLM hook) → a credit with no
+  signal defaults to `Income`.
+- Wired into `workers/processor.py` after `validate_statement`, before `mark_completed`.
+
+**API:**
+- `GET /review/categorizations` — the "Needs a category" lane (design-notes §3.4): txns with
+  `category_source == "NONE"`, grouped by merchant with a count, total, and the sub-threshold
+  suggestion.
+- `PUT /transactions/{id}/category` — a per-transaction override (`user_category`), **that one
+  row only**.
+- `PUT /category-rules` / `GET /category-rules` / `DELETE /category-rules/{merchant}` — a
+  merchant-wide rule; upsert re-resolves every non-overridden txn of that merchant, delete
+  restores their predictions.
+- `GET /batches/{id}` gained `uncategorized_count`.
+
+**Analytics (the Part-B code on this branch's base) updated:** `merchant_totals` /
+`recurring_charges` group on `merchant_normalized`; `spending_by_category` and the "spending"
+side of `trends` count only spending categories; `cash_flow` gained `spending_cents` and
+`transfers_cents` lines so a transfer is visible, not hidden in `net`.
+
+**Deviations from the plan:** none of substance. `_amounts_are_stable` already handled the
+zero case; `merchant_normalization` keeps corporate suffixes ("Acme Corp", "Google Llc") —
+good enough for v1, refinement is ongoing.
+
+**Tests:** `uv run pytest` — **165 passed, 97% coverage** (gate 90). `ruff` clean. New:
+`test_merchant_normalization.py`, `test_categorization.py`, `test_transactions_api.py`,
+`test_category_rules_api.py`, plus the uncategorized-lane case in `test_review_api.py` and the
+transfer/merchant cases in `test_analytics.py`.
+
+**Not done here (Part 2):** the Privacy Gateway sanitizer, the `LLMProvider` abstraction
+(Claude `claude-sonnet-5` / OpenAI `gpt-5.6-luna`, provider and model configured separately),
+LLM-assisted categorization, `GET /analytics/explanation`, and the build-plan leak test.
+Manual live-server E2E pending (dev DB still locked); runbook at
+`docs/manual-verification-categorization.md`.
+
+**Repo note:** branched `feature/categorization-privacy-llm` off `feature/analytics-engine`
+(PR #12) — stacked; #12 merges first.
+
+**Next step:** build-plan #8 Part 2.

@@ -45,9 +45,20 @@ category, top merchants, recurring-charge detection (merchant + regular cadence 
 not necessarily identical amount, so a subscription with price drift is still caught),
 month-over-month trends, and a coverage summary (statements included vs. excluded and why, the
 ledger's real date span) shown alongside every total. No LLM, no bank-specific branching, money
-in integer cents, ratios as fixed-precision strings. Next: `build-plan.md` #8 —
-categorization, the Privacy Gateway, and the optional LLM explanation layer. Progress is logged
-in [`docs/activity.md`](./docs/activity.md), and written up for humans as a build log at
+in integer cents, ratios as fixed-precision strings.
+
+Each transaction is then given a normalized merchant ("UBER *TRIP 8AF3" and "UBER TECHNOLOGIES"
+both become "Uber") and a category, resolved through a fixed, non-destructive hierarchy: a
+per-transaction user override, then a saved merchant rule, then the deterministic prediction
+(a built-in merchant/keyword map) — and only if that clears a 0.75 confidence gate, otherwise
+the transaction goes to the Review queue rather than being labelled on a weak guess. The
+automated guess is stored separately and never discarded, so removing a rule restores it with
+no bulk rewrite. Every category carries an income / expense / transfer type, so a transfer
+between your own accounts never counts as spending. `PUT /transactions/{id}/category` records a
+single correction; `PUT /category-rules` makes it merchant-wide. LLM-assisted categorization
+for the merchants the rules miss, plus a plain-English dashboard summary — both behind a
+Privacy Gateway that strips PII first — are `build-plan.md` #8 part 2. Progress is logged in
+[`docs/activity.md`](./docs/activity.md), and written up for humans as a build log at
 [kervintznoel.com/posts](https://kervintznoel.com/posts/build-log-1-a-window-that-says-ok).
 
 ## What it does (v1)
