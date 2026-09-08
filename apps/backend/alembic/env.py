@@ -8,6 +8,7 @@ from app.db import DATABASE_URL
 from app.models import (  # noqa: F401
     Account,
     Batch,
+    CategoryRule,
     IntakeFile,
     Statement,
     StatementJob,
