@@ -140,6 +140,59 @@ def test_get_batch_404_for_unknown_id(client: TestClient):
     assert client.get("/batches/does-not-exist").status_code == 404
 
 
+def test_list_batches_is_paginated_and_newest_first(
+    client: TestClient, session: Session
+):
+    from datetime import UTC, datetime
+
+    from app.models import Batch
+
+    for i in range(5):
+        session.add(
+            Batch(
+                created_at=datetime(2026, 1, i + 1, tzinfo=UTC),
+                selected=1,
+                uploaded=1,
+                upload_failed=0,
+                validation_failed=0,
+                processed=1,
+                processing_failed=0,
+                status="COMPLETED",
+            )
+        )
+    session.commit()
+
+    body = client.get("/batches", params={"page": 1, "page_size": 2}).json()
+    assert body["total"] == 5
+    assert body["page_size"] == 2
+    assert len(body["items"]) == 2
+    # newest first
+    assert body["items"][0]["created_at"] > body["items"][1]["created_at"]
+
+    page2 = client.get("/batches", params={"page": 2, "page_size": 2}).json()
+    assert len(page2["items"]) == 2
+    assert page2["items"][0]["id"] not in {i["id"] for i in body["items"]}
+
+    assert client.get("/batches", params={"page_size": 0}).status_code == 422
+
+
+def test_list_batches_includes_statement_rollup(
+    client: TestClient, session: Session, session_factory: Callable[[], Session]
+):
+    client.post(
+        "/batches",
+        files=[("files", ("s.pdf", build_santander_sample(), "application/pdf"))],
+    )
+    assert run_worker_once(session_factory) is True
+    session.expire_all()
+
+    (item,) = client.get("/batches").json()["items"]
+    assert item["statement_count"] == 1
+    assert item["period_start"] is not None
+    assert item["period_end"] is not None
+    assert item["status"] in {"COMPLETED", "COMPLETED_WITH_WARNINGS"}
+
+
 def test_reuploading_a_statement_in_a_second_batch_is_deduped(
     client: TestClient,
     session: Session,

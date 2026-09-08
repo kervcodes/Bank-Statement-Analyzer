@@ -1,2 +1,5 @@
 allowBuilds:
   electron-winstaller: false
+  # msw's postinstall only sets up the browser Service Worker file; our tests
+  # run under jsdom via msw/node, which doesn't need it.
+  msw: false

@@ -1,4 +1,4 @@
-import { app, BrowserWindow } from 'electron'
+import { app, BrowserWindow, ipcMain, nativeTheme } from 'electron'
 import { spawn, type ChildProcess } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -45,6 +45,14 @@ function createWindow() {
     win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
   }
 }
+
+ipcMain.on('theme:get', (event) => {
+  event.returnValue = nativeTheme.shouldUseDarkColors
+})
+
+nativeTheme.on('updated', () => {
+  win?.webContents.send('theme:changed', nativeTheme.shouldUseDarkColors)
+})
 
 app.whenReady().then(() => {
   startBackend()

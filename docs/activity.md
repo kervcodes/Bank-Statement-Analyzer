@@ -932,3 +932,75 @@ in the suite (every provider test uses `httpx.MockTransport`). `ruff` clean.
   confidence) still needs a labelled pass over the 12 real statements.
 
 **Next step:** build-plan #9 — the frontend screens (Dashboard, Review, Settings, Accounts).
+
+---
+
+## 2026-09-08 — Frontend foundation + Import + History (build-plan #9, PR 1 of 3)
+
+**Prompt:** "Approved. Proceed with the 3-PR split" + locked decisions (hash router,
+12-month dashboard default, Recharts, duplicate-review `keep_both`/`confirm` semantics,
+read-only Accounts) and two constraints — **all list endpoints paginated**, and **state
+boundaries** (TanStack Query = server state, local React state = UI-only, router search params
+= navigation/filter state; no Redux/Zustand). "Keep the frontend foundation minimal — build
+only what Import + History need."
+
+**#9 is split into 3 PRs.** PR 1 (this one) is the vertical slice: open app → import statements
+→ backend processes → frontend reports status → see previous imports. **No Dashboard or
+Review** — those routes are honest "lands in the next update" placeholders so the sidebar nav
+doesn't 404.
+
+### Backend — `GET /batches` (`app/api/batches.py`)
+
+Paginated list for History: `?page` (≥1, default 1) / `?page_size` (1–100, default 20),
+deterministic sort `created_at DESC, id DESC`. Response `{items, page, page_size, total}`.
+Each item carries the batch counters + status + a **statement rollup** (`statement_count`,
+`period_start`, `period_end` — the "Jan 2026 – Aug 2026" label) computed in one grouped query,
+not N+1. 4 tests in `test_batches_api.py`; 223 backend tests pass.
+
+`GET /transactions` (PR 2) is planned with the same shape — filters `category` / `merchant` /
+`account_id` / `batch_id` / `date_from` / `date_to` + `page` / `page_size` / `sort` — so the
+API isn't painted into a corner; not implemented yet.
+
+### Frontend (`apps/desktop`)
+
+Was a bare skeleton (one `/health` fetch). Added, deliberately minimal:
+- **Deps:** `@tanstack/react-query`, `react-router-dom` v7, `lucide-react`, `sonner`, the
+  shadcn utils (`clsx` / `tailwind-merge` / `class-variance-authority`). Dev: `vitest` +
+  `@testing-library/react` + `jsdom` + `msw`.
+- **Shell:** `App.tsx` = sidebar + `<Outlet/>` + toaster; `Sidebar.tsx` with a non-blocking
+  "N batches processing" pill that only polls while something runs; `ErrorBoundary` (friendly
+  message, not a stack trace); `createHashRouter` (Electron `file://`).
+- **`lib/api.ts`** — typed fetch wrappers, one base URL, an `ApiError` with a status. No state.
+- **`lib/format.ts`** — `formatPeriod` / `formatDate` (calendar dates pinned to local midnight
+  so they don't slide a day), `formatBytes`, and the status → `{tone, label, icon}` map
+  (design-notes §4: colour is never the only signal — `StatusBadge` always pairs all three).
+- **Dark mode** — `.dark` class on `<html>` driven by Electron `nativeTheme` through a tiny
+  `preload.ts` bridge (`window.desktop`), falling back to `matchMedia` outside Electron.
+  Tailwind v4 `@custom-variant dark`.
+- **Import** (`design-notes` §3.2) — drag-drop / browse, a **client-side pre-check**
+  (extension, 25 MB) shown per file before upload, `POST /batches`, the backend's per-file
+  `ACCEPTED` / `VALIDATION_FAILED` reasons rendered, "Start analysis (N)" counting only ready
+  files and never blocked by a bad one, then navigate to History + a toast.
+- **History** (§3.3) — `GET /batches` table, page controls, expand a row → `GET /batches/{id}`
+  for its statements with per-statement validation/dedup status and the intake-rejection note.
+  Empty state routes to Import. `?page` / `?batch` live in the URL. Polls while any batch on
+  the page is non-terminal.
+- **Tests:** `pnpm test:run` — **14 pass** (`format.test.ts`, `ImportRoute.test.tsx`,
+  `HistoryRoute.test.tsx`, MSW-mocked). `pnpm lint` (oxlint) + `pnpm typecheck` (tsc) clean.
+  `pnpm build` produces the renderer + electron main + preload bundles.
+- **CI:** a `frontend` job added to `.github/workflows/ci.yml` (`pnpm install --frozen-lockfile`
+  → lint → typecheck → test), `ELECTRON_SKIP_BINARY_DOWNLOAD=1`. Backend job unchanged.
+  `techstack.md` §15's "CI runs ruff + pytest" line is now stale — flagged for the owner, not
+  edited (it's a spec doc).
+
+**Deviations from the plan:** dropped the `<input accept="application/pdf">` attribute — it
+made the browse dialog pre-filter, which hid the "rejected: not a PDF" state the screen is
+supposed to show; the JS pre-check is the single gate now. shadcn primitives are hand-vendored
+(Button, Card, StatusBadge) rather than pulled via the CLI — "not a design-system project".
+
+**Not done (PR 2 / PR 3):** Dashboard, Review, the transaction drawer, Accounts, Settings +
+`safeStorage`, and `GET /transactions` / `GET /accounts` / the Review write actions.
+
+**Repo note:** branch `feature/frontend-screens` off `main` (PR #14 merged).
+
+**Next step:** build-plan #9 PR 2 — Dashboard + Review + the transaction drawer.
