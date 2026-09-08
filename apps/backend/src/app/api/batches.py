@@ -5,7 +5,9 @@ processing job for every accepted file (REQ-PROC-002/004). The background worker
 (app/workers/) picks the jobs up; GET /batches/{id} reports progress.
 """
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from datetime import date, datetime
+
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 from sqlmodel import Session, col, func, select
 
@@ -66,6 +68,30 @@ class BatchStatusResponse(BaseModel):
     uncategorized_count: int
     jobs: list[JobStatus]
     statements: list[StatementSummary]
+
+
+class BatchListItem(BaseModel):
+    id: str
+    created_at: datetime
+    status: str
+    selected: int
+    uploaded: int
+    upload_failed: int
+    validation_failed: int
+    processed: int
+    processing_failed: int
+    statement_count: int
+    # min/max of the produced statements' periods -- the "Jan–Dec 2026" label in
+    # History. Null while a batch has produced no statements yet.
+    period_start: date | None = None
+    period_end: date | None = None
+
+
+class BatchListResponse(BaseModel):
+    items: list[BatchListItem]
+    page: int
+    page_size: int
+    total: int
 
 
 @router.post("", response_model=BatchIntakeResponse)
@@ -176,6 +202,62 @@ async def create_batch(
         validation_failed=batch.validation_failed,
         files=results,
     )
+
+
+@router.get("", response_model=BatchListResponse)
+def list_batches(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    session: Session = Depends(get_db_session),  # noqa: B008
+) -> BatchListResponse:
+    """Past import batches, newest first (REQ-RPT: the History screen). Paginated;
+    sort is deterministic (`created_at` then `id`, both descending)."""
+    total = session.exec(select(func.count()).select_from(Batch)).one()
+
+    batches = session.exec(
+        select(Batch)
+        .order_by(col(Batch.created_at).desc(), col(Batch.id).desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    ).all()
+
+    ids = [b.id for b in batches]
+    # one grouped query for the per-batch statement count + period span
+    rollup: dict[str, tuple[int, date | None, date | None]] = {}
+    if ids:
+        rows = session.exec(
+            select(
+                col(Statement.batch_id),
+                func.count(),
+                func.min(col(Statement.statement_start_date)),
+                func.max(col(Statement.statement_end_date)),
+            )
+            .where(col(Statement.batch_id).in_(ids))
+            .group_by(col(Statement.batch_id))
+        ).all()
+        rollup = {r[0]: (r[1], r[2], r[3]) for r in rows}
+
+    items = []
+    for b in batches:
+        count, start, end = rollup.get(b.id, (0, None, None))
+        items.append(
+            BatchListItem(
+                id=b.id,
+                created_at=b.created_at,
+                status=b.status,
+                selected=b.selected,
+                uploaded=b.uploaded,
+                upload_failed=b.upload_failed,
+                validation_failed=b.validation_failed,
+                processed=b.processed,
+                processing_failed=b.processing_failed,
+                statement_count=count,
+                period_start=start,
+                period_end=end,
+            )
+        )
+
+    return BatchListResponse(items=items, page=page, page_size=page_size, total=total)
 
 
 @router.get("/{batch_id}", response_model=BatchStatusResponse)
