@@ -6,7 +6,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.analytics import router as analytics_router
 from app.api.batches import router as batches_router
+from app.api.category_rules import router as category_rules_router
 from app.api.review import router as review_router
+from app.api.transactions import router as transactions_router
 from app.workers.pool import BackgroundWorker
 
 # Started on app startup, stopped on shutdown. Bare TestClient(app) does not
@@ -28,6 +30,8 @@ app = FastAPI(lifespan=lifespan)
 app.include_router(batches_router)
 app.include_router(review_router)
 app.include_router(analytics_router)
+app.include_router(transactions_router)
+app.include_router(category_rules_router)
 
 # Single-user local desktop app: the renderer (Vite dev server or a packaged
 # file:// origin) is always cross-origin from this sidecar on 127.0.0.1, and

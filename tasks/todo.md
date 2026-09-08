@@ -107,64 +107,64 @@ Recompute points: the categorize pass on a new statement; `PUT /transactions/{id
       (2 txns preserved, `category` → `Uncategorized`, integrity + FK checks clean, CHECK fires).
 
 #### P1-2. Merchant normalization — `app/services/merchant_normalization.py`
-- [ ] `normalize_merchant(description_normalized) -> str` — pure. Uppercase; strip processor
+- [x] `normalize_merchant(description_normalized) -> str` — pure. Uppercase; strip processor
       prefixes (`SQ *`, `TST* `, `PP*`, `PAYPAL *`, `POS `, `ACH `, `DEBIT CARD PURCHASE`),
       trailing store #s / city+state / dates / ref numbers; map via `MERCHANT_ALIASES`.
-- [ ] `tests/test_merchant_normalization.py` — `"UBER *TRIP …"` & `"UBER TECHNOLOGIES"` →
+- [x] `tests/test_merchant_normalization.py` — `"UBER *TRIP …"` & `"UBER TECHNOLOGIES"` →
       `"Uber"` (REQ-CAT-002); real-shaped Santander descriptions; unknown merchant → cleaned
       but recognizable.
 
 #### P1-3. Deterministic categorization — `app/services/categorization.py` + `categorization_rules.py`
-- [ ] `categorization_rules.py` — `MERCHANT_ALIASES`, `MERCHANT_CATEGORY` (exact merchant →
+- [x] `categorization_rules.py` — `MERCHANT_ALIASES`, `MERCHANT_CATEGORY` (exact merchant →
       category, `RULE_CONFIDENCE_MERCHANT ≈ 0.97`), `KEYWORD_CATEGORY` (token → category,
       `RULE_CONFIDENCE_KEYWORD ≈ 0.80`), credit-side rules. Confidences are named constants
       with a "calibrate against real data" comment.
-- [ ] `predict_category(merchant, direction) -> Prediction(category, confidence, source)` —
+- [x] `predict_category(merchant, direction) -> Prediction(category, confidence, source)` —
       deterministic only (LLM hook is Part 2, inserted between keyword rules and the `NONE`
       fallback).
-- [ ] `resolve_category(session, txn) -> None` — the decision-7 invariant; writes `category` +
+- [x] `resolve_category(session, txn) -> None` — the decision-7 invariant; writes `category` +
       `category_source`.
-- [ ] `categorize_statement(session, statement) -> None` — for each txn: `merchant_normalized`
+- [x] `categorize_statement(session, statement) -> None` — for each txn: `merchant_normalized`
       = normalize; `predicted_*` = predict; then `resolve_category`. Skips a txn whose
       `user_category` is already set. Idempotent.
-- [ ] `tests/test_categorization.py` — merchant-map hit ≥ threshold assigns; keyword hit;
+- [x] `tests/test_categorization.py` — merchant-map hit ≥ threshold assigns; keyword hit;
       unknown → `Uncategorized`/`NONE`; a merchant rule beats prediction but loses to
       `user_category`; deleting the rule restores the prediction; `categorize_statement`
       idempotent; a transfer-type category is excluded from spending.
 
 #### P1-4. Pipeline hook
-- [ ] `processor.process_job`: `categorize_statement` after `validate_statement`, before
+- [x] `processor.process_job`: `categorize_statement` after `validate_statement`, before
       `mark_completed`. Worker test: a produced statement's transactions come out with
       `merchant_normalized` + a resolved `category`.
 
 #### P1-5. Review lane + correction endpoints
-- [ ] `GET /review/categorizations` — txns with `category_source == "NONE"`, grouped by
+- [x] `GET /review/categorizations` — txns with `category_source == "NONE"`, grouped by
       `merchant_normalized`, count + sample + the (sub-threshold) `predicted_category`.
-- [ ] `app/api/transactions.py` (new) — `PUT /transactions/{id}/category {category}`:
+- [x] `app/api/transactions.py` (new) — `PUT /transactions/{id}/category {category}`:
       validate ∈ `CATEGORIES`; set `user_category`; `resolve_category`; return the txn. **This
       one transaction only.**
-- [ ] `app/api/category_rules.py` (new) — `GET /category-rules`; `PUT /category-rules
+- [x] `app/api/category_rules.py` (new) — `GET /category-rules`; `PUT /category-rules
       {merchant, category}` (upsert, then `resolve_category` for every txn of that merchant
       with no `user_category`); `DELETE /category-rules/{merchant}` (delete, then re-resolve —
       predictions restored). Each returns the affected-row count.
-- [ ] `GET /batches/{id}`: add `uncategorized_count`.
-- [ ] `tests/test_transactions_api.py`, `tests/test_category_rules_api.py` — txn edit is
+- [x] `GET /batches/{id}`: add `uncategorized_count`.
+- [x] `tests/test_transactions_api.py`, `tests/test_category_rules_api.py` — txn edit is
       isolated; a rule flips only non-user siblings; deleting a rule reverts them; unknown
       category → 422; bad id → 404.
 
 #### P1-6. Analytics on merchant + transaction type
-- [ ] `analytics.py`: group `merchant_totals` / `recurring_charges` on `merchant_normalized or
+- [x] `analytics.py`: group `merchant_totals` / `recurring_charges` on `merchant_normalized or
       description_normalized`. `spending_by_category` and the "spending" side of `trends` count
       only spending categories (decision 3 / taxonomy helper). `cash_flow` stays literal
       credits/debits but gains a `transfers_cents` line so a checking↔savings transfer is
       visible, not hidden.
-- [ ] Update `test_analytics.py`; add: two raw descriptions for one merchant now aggregate;
+- [x] Update `test_analytics.py`; add: two raw descriptions for one merchant now aggregate;
       a `Transfers` debit is **not** in `spending_by_category`.
 
 #### P1-7. Part 1 checks & docs
-- [ ] `uv run pytest` (≥ 90), `ruff check`, `ruff format --check`.
-- [ ] `docs/activity.md`; `README.md` Status; `docs/manual-verification-categorization.md`.
-- [ ] `tasks/todo.md` Part 1 Review.
+- [x] `uv run pytest` (≥ 90), `ruff check`, `ruff format --check`.
+- [x] `docs/activity.md`; `README.md` Status; `docs/manual-verification-categorization.md`.
+- [x] `tasks/todo.md` Part 1 Review.
 
 ### Part 2 — Privacy Gateway + LLM
 
@@ -216,6 +216,44 @@ Recompute points: the categorize pass on a new statement; `PUT /transactions/{id
 
 ## Review
 
-### Part 1 — _(filled in when Part 1 is done)_
+### Part 1 — Rule-based categorization + merchant normalization (this PR)
+
+**Completed:** `app/models/taxonomy.py`, the `Transaction` columns + `CategoryRule` +
+migration `208f30aad50f`, `app/services/{merchant_normalization,categorization_rules,
+categorization}.py`, the `processor.py` hook, `app/api/{transactions,category_rules}.py` +
+`GET /review/categorizations` + `uncategorized_count`, and the analytics changes
+(merchant/transfer awareness). Branch `feature/categorization-privacy-llm` off
+`feature/analytics-engine` (stacked — PR #12 merges first).
+
+**Design (owner's locked decisions):**
+- The effective `category` is **resolved, not mutated**: `USER → MERCHANT RULE → prediction
+  (≥ 0.75) → Review`. `predicted_*` is stored separately and never discarded, so deleting a
+  rule or override restores it — `test_deleting_a_merchant_rule_restores_the_prediction`.
+- Fixed 22-category taxonomy, each with an `income` / `expense` / `transfer` type. Spending =
+  `expense` + `Uncategorized` debits only. Analytics enforces this everywhere.
+- `AUTO_ASSIGN_THRESHOLD = 0.75`, a named constant, to be calibrated against the 12 real
+  statements (optimize precision on auto-assigned).
+- Built-in rules live in code (`categorization_rules.py`), not seeded DB rows. `CategoryRule`
+  holds only user corrections. A `_validate()` at import guards against a rule naming a
+  category the taxonomy doesn't have.
+- A plain `PUT /transactions/{id}/category` is one row only; `PUT /category-rules` is the
+  explicit merchant-wide action.
+
+**Deviations:** none of substance. `merchant_normalization` leaves corporate suffixes
+("Acme Corp", "Google Llc") — fine for v1. The LLM hook (`_llm_prediction`) is present but
+returns `None` until Part 2 (one uncovered line).
+
+**Tests:** `uv run pytest` — **165 passed, 97% coverage** (gate 90). `ruff check` /
+`ruff format --check` clean. New: `test_merchant_normalization.py` (18),
+`test_categorization.py` (12), `test_transactions_api.py` (3), `test_category_rules_api.py`
+(5), + `test_review_api.py` / `test_analytics.py` additions.
+
+**Known / follow-ups:**
+- Live-server manual E2E not run (dev DB locked, same as #7). Runbook:
+  `docs/manual-verification-categorization.md`.
+- Confidence constants (0.97 / 0.78 / 0.80) and the 0.75 gate are un-calibrated guesses —
+  needs a labelled pass over the real statements.
+- `merchant_normalization` and the built-in maps are small; they grow with real use and
+  Part 2's LLM fallback covers the gaps.
 
 ### Part 2 — _(filled in when Part 2 is done)_

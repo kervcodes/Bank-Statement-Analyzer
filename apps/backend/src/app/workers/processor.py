@@ -20,6 +20,7 @@ from sqlmodel import Session
 
 from app.models import StatementJob, SubCentPrecisionError
 from app.parsers.base import ParserError
+from app.services.categorization import categorize_statement
 from app.services.detection import CONFIDENCE_THRESHOLD, detect
 from app.services.extraction import ExtractionFailedError, extract_text
 from app.services.financial_validation import validate_statement
@@ -58,6 +59,9 @@ def process_job(session: Session, job: StatementJob) -> None:
             statement.validation_result = validate_statement(session, statement)
             session.add(statement)
             session.commit()
+            # Deterministic categorization (build-plan #8): merchant + category
+            # for every transaction. Runs regardless of validation_result.
+            categorize_statement(session, statement)
             mark_completed(
                 session,
                 job,

@@ -117,3 +117,66 @@ def test_lists_a_possible_duplicate_with_its_match(
     assert pair["transaction"]["amount_cents"] == 782
     assert pair["matches"]["amount_cents"] == 782
     assert pair["transaction"]["statement_id"] != pair["matches"]["statement_id"]
+
+
+def _stmt_for(session: Session) -> Statement:
+    batch = Batch(
+        selected=1,
+        uploaded=1,
+        upload_failed=0,
+        validation_failed=0,
+        processed=1,
+        processing_failed=0,
+        status="COMPLETED",
+    )
+    session.add(batch)
+    session.commit()
+    s = Statement(
+        batch_id=batch.id,
+        bank="Santander",
+        account_type="checking",
+        account_identifier_masked="0520",
+        statement_start_date=date(2026, 1, 1),
+        statement_end_date=date(2026, 1, 31),
+        opening_balance_cents=0,
+        closing_balance_cents=0,
+        parser_version="santander_checking_v1",
+        extraction_status="SUCCESS",
+        validation_result="VALID",
+    )
+    session.add(s)
+    session.commit()
+    return s
+
+
+def test_uncategorized_lane_groups_by_merchant(client: TestClient, session: Session):
+    s = _stmt_for(session)
+    for desc, merchant, cents, src in [
+        ("ZZQ VENDOR 1", "Zzq Vendor", 4_000, "NONE"),
+        ("ZZQ VENDOR 2", "Zzq Vendor", 2_000, "NONE"),
+        ("NETFLIX.COM", "Netflix", 1_599, "RULE"),  # confidently categorized
+    ]:
+        session.add(
+            Transaction(
+                statement_id=s.id,
+                transaction_date=date(2026, 1, 10),
+                posted_date=date(2026, 1, 10),
+                description_raw=desc,
+                description_normalized=desc,
+                amount_cents=cents,
+                direction="DEBIT",
+                source_bank="Santander",
+                source_page=1,
+                merchant_normalized=merchant,
+                category="Uncategorized" if src == "NONE" else "Subscriptions",
+                category_source=src,
+            )
+        )
+    session.commit()
+
+    body = client.get("/review/categorizations").json()
+    assert len(body["groups"]) == 1
+    group = body["groups"][0]
+    assert group["merchant"] == "Zzq Vendor"
+    assert group["transaction_count"] == 2
+    assert group["total_cents"] == 6_000
