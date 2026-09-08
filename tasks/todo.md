@@ -63,27 +63,26 @@ using adversarial examples.
       **serialized** payload; ordinary merchants survive; every fail-closed path; the
       allowlist rejects an extra field. **188 passed, privacy_gateway.py 100% coverage.**
 
-### P2-2. Provider abstraction — `app/llm/`
-- [ ] `base.py` — `LLMProvider` Protocol: `categorize(payload: dict) -> CategorySuggestion | None`,
-      `explain(payload: dict) -> str | None`; `CategorySuggestion(category: str, confidence:
-      float)`; `LLMUnavailable(Exception)`; a `name` / `model` attribute for labelling.
-- [ ] `null.py` — `NullProvider`: both methods return `None`. Used when no key is configured.
-- [ ] `openai.py` — `OpenAIProvider(api_key, model, *, timeout=20, client=None)`. `httpx` POST
-      to the chat/completions endpoint; system prompt pins the output to a JSON object
-      `{"category": <one of CATEGORIES>, "confidence": 0..1}` and forbids inventing a category;
-      parse + validate against `CATEGORIES` (unknown → treat as no suggestion). Any
-      non-2xx / network error / bad JSON → `raise LLMUnavailable`. `client` injectable for
-      tests (an `httpx.Client` with a `MockTransport`).
-- [ ] `anthropic.py` — `AnthropicProvider(...)`, same contract, `/v1/messages`, `x-api-key` +
-      `anthropic-version` headers (confirm via the `claude-api` skill).
-- [ ] `providers.py` — `configured_providers() -> list[LLMProvider]`: read env; the one named
-      by `LLM_PROVIDER` first, the other second, each included only if its key is present;
-      empty list → caller falls back to `NullProvider`.
-- [ ] `uv add httpx` (promote from dev to runtime). `.env.example` updated with the five vars.
-- [ ] `tests/test_llm_providers.py` — `NullProvider` returns `None`; `OpenAIProvider` /
-      `AnthropicProvider` parse a good mocked response, and turn a 500 / a timeout / malformed
-      JSON into `LLMUnavailable`; `configured_providers()` ordering for each `LLM_PROVIDER`
-      value and with keys missing.
+### P2-2. Provider abstraction — `app/llm/`  ✅
+- [x] `base.py` — `LLMProvider` Protocol (`categorize` / `explain`), `CategorySuggestion`,
+      `LLMUnavailable`, and `parse_category_suggestion` (fence-strips, finds the first `{…}`,
+      validates the category ∈ `CATEGORIES`, clamps confidence). **`None` = answered-but-unusable
+      (→ Review, no fallback); `LLMUnavailable` = failed (→ fallback).**
+- [x] `null.py` — `NullProvider`, both methods `None`.
+- [x] `openai_provider.py` / `anthropic_provider.py` — raw `httpx` (deviation from the
+      `claude-api` skill's SDK recommendation — noted in `docs/activity.md`; rationale: the
+      codebase has no SDKs, keeps its dep surface small, and one transport = uniform
+      `MockTransport` testing). Injectable `client` for tests. Any HTTP/parse error →
+      `LLMUnavailable`. Anthropic: parses the first `text` block (thinking-block safe);
+      `categorize` disables thinking, `explain` leaves it adaptive.
+- [x] `providers.py` — `configured_providers()`: `LLM_PROVIDER` (default `openai`) picks the
+      order; each provider included only if its key is present; `[]` when neither.
+- [x] `uv add httpx` (promoted to runtime; removed the dev duplicate). `.env.example` created
+      with `LLM_PROVIDER` / `OPENAI_*` / `ANTHROPIC_*`.
+- [x] `tests/test_llm_providers.py` (18) — all `app/llm/` files at 100%. Good reply parsed;
+      unknown category / malformed → `None`; fenced JSON parsed; 500 / timeout / 429 →
+      `LLMUnavailable`; Anthropic skips a leading thinking block; `configured_providers()`
+      ordering for each `LLM_PROVIDER` and with keys missing. **205 passed, 97%.**
 
 ### P2-3. The single gateway — `app/services/llm_gateway.py`
 - [ ] `suggest_category(*, merchant, description_normalized, amount_cents, direction) ->

@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.19.2",
     "fastapi>=0.141.1",
+    "httpx>=0.28.1",
     "pdf2image>=1.17.0",
     "pdfplumber>=0.11.10",
     "pypdf>=6.4.0",
@@ -28,7 +29,6 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "httpx>=0.28.1",
     "pillow>=12.3.0",
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
