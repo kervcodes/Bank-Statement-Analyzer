@@ -44,7 +44,7 @@ pdftoppm -v
 
 Drop your real statements in:
 
-```
+```text
 apps\backend\tests\fixtures\statements\local\
 ```
 

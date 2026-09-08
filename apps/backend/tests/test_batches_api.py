@@ -3,7 +3,7 @@ from io import BytesIO
 from pathlib import Path
 
 import pytest
-from _pdf import NATIVE_TEXT_PAGE, build_pdf
+from _santander_sample import build_santander_sample
 from fastapi.testclient import TestClient
 from pypdf import PdfWriter
 from sqlmodel import Session, select
@@ -101,7 +101,7 @@ def test_accepted_file_is_queued_and_processed_end_to_end(
     files = [
         (
             "files",
-            ("chase_march.pdf", build_pdf([NATIVE_TEXT_PAGE]), "application/pdf"),
+            ("santander_march.pdf", build_santander_sample(), "application/pdf"),
         ),
         ("files", ("notes.txt", b"hello", "text/plain")),
     ]
@@ -124,6 +124,12 @@ def test_accepted_file_is_queued_and_processed_end_to_end(
     assert len(status["jobs"]) == 1
     assert status["jobs"][0]["status"] == "COMPLETED"
     assert status["jobs"][0]["extraction_method"] == "NATIVE"
+
+    # build-plan #6: the produced statement is on the batch status response.
+    assert len(status["statements"]) == 1
+    assert status["statements"][0]["bank"] == "Santander"
+    assert status["statements"][0]["validation_result"] == "VALID"
+    assert status["statements"][0]["account_identifier_masked"] == "7890"
 
 
 def test_get_batch_404_for_unknown_id(client: TestClient):

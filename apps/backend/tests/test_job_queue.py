@@ -9,9 +9,10 @@ from pathlib import Path
 
 import pytest
 from _pdf import NATIVE_TEXT_PAGE, build_pdf
-from sqlmodel import Session, col, select
+from _santander_sample import build_santander_sample
+from sqlmodel import Session, col, func, select
 
-from app.models import Batch, IntakeFile, StatementJob
+from app.models import Batch, IntakeFile, Statement, StatementJob
 from app.services.extraction import ExtractionFailedError
 from app.workers import processor
 from app.workers.coordinator import refresh_batch
@@ -71,8 +72,15 @@ def test_run_worker_once_completes_a_native_job(
     job = session.get(StatementJob, queued_job.id)
     assert job.status == "COMPLETED"
     assert job.extraction_method == "NATIVE"
-    assert job.page_count == 1
+    assert job.page_count == 2
     assert job.failure_reason is None
+
+    # build-plan #6: a completed job produced one validated Statement.
+    assert job.statement_id is not None
+    statement = session.get(Statement, job.statement_id)
+    assert statement.bank == "Santander"
+    assert statement.validation_result == "VALID"
+    assert len(statement.transactions) == 10
 
 
 def test_run_worker_once_returns_false_on_empty_queue(
@@ -293,3 +301,81 @@ def test_req_proc_004_rejected_intake_files_never_get_a_job(
         select(StatementJob).where(col(StatementJob.batch_id) == batch.id)
     ).all()
     assert jobs == []
+
+
+# --- build-plan #6: detect -> parse -> normalize -> validate --------------
+
+
+def _job_for(session: Session, batch: Batch, pdf_path: Path) -> StatementJob:
+    f = _accepted_file(session, batch, pdf_path)
+    return enqueue_job(
+        session, batch_id=batch.id, intake_file_id=f.id, pdf_path=f.temp_path
+    )
+
+
+def test_req_det_002_low_confidence_detection_marks_the_job_unsupported(
+    session: Session,
+    session_factory: Callable[[], Session],
+    native_pdf_path: Path,
+):
+    batch = _batch(session)
+    job = _job_for(session, batch, native_pdf_path)
+
+    run_worker_once(session_factory)
+
+    session.expire_all()
+    job = session.get(StatementJob, job.id)
+    assert job.status == "UNSUPPORTED"
+    assert job.statement_id is None
+    assert "confidence" in job.failure_reason
+    # REQ-VAL-005: no Statement row for a file that was not parsed
+    assert session.exec(select(func.count()).select_from(Statement)).one() == 0
+
+
+def test_req_proc_102_parser_error_fails_the_job_with_no_statement(
+    session: Session,
+    session_factory: Callable[[], Session],
+    santander_pdf_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from app.parsers import santander_checking_v1
+    from app.parsers.base import ParserError
+
+    def _boom(*_args, **_kwargs):
+        raise ParserError("a column shifted")
+
+    monkeypatch.setattr(santander_checking_v1, "parse", _boom)
+
+    batch = _batch(session)
+    job = _job_for(session, batch, santander_pdf_path)
+
+    run_worker_once(session_factory)
+
+    session.expire_all()
+    job = session.get(StatementJob, job.id)
+    assert job.status == "FAILED"
+    assert job.attempt_count == 1  # deterministic, not retried
+    assert job.statement_id is None
+    assert session.exec(select(func.count()).select_from(Statement)).one() == 0
+
+
+def test_a_statement_that_does_not_reconcile_completes_the_job_but_warns_the_batch(
+    session: Session,
+    session_factory: Callable[[], Session],
+    tmp_path: Path,
+):
+    unbalanced = tmp_path / "unbalanced.pdf"
+    unbalanced.write_bytes(build_santander_sample(balanced=False))
+
+    batch = _batch(session)
+    job = _job_for(session, batch, unbalanced)
+
+    run_worker_once(session_factory)
+
+    session.expire_all()
+    job = session.get(StatementJob, job.id)
+    assert job.status == "COMPLETED"  # the PDF parsed fine
+    statement = session.get(Statement, job.statement_id)
+    assert statement.validation_result == "FAILED"  # the numbers don't add up
+    # REQ-RPT-002 / REQ-VAL-003: the batch is not a clean COMPLETED
+    assert session.get(Batch, batch.id).status == "COMPLETED_WITH_WARNINGS"

@@ -502,3 +502,114 @@ intake) → `GET /batches/{id}` reported it; unknown batch id → 404.
 `main`, so it's a stacked PR — PR #7 should merge first.
 
 **Next step:** build-plan.md #6 — bank detection and parsing.
+
+---
+
+## 2026-09-08 — First bank parser end to end: Santander checking (build-plan #6)
+
+**Prompt:** "start the plan for #6" → approved plan → "I dropped 12 statements in the local
+folder". Traces to `requirements.md` §5 (REQ-DET-001..004), §6 (REQ-NORM-001..006), §7
+(REQ-ACC-001/002), §8 (REQ-VAL-001..005), NFR-MAINT-001/002.
+
+**Target institution (open item in `techstack.md` §20, now closed):** Santander checking,
+`santander_checking_v1`. The user provided 12 consecutive real monthly statements
+(Sept 2025 – Aug 2026, "SIMPLY RIGHT CHECKING", formerly Sovereign Bank e-statements) in the
+gitignored `apps/backend/tests/fixtures/statements/local/`. The parser and detection were
+tuned against those, then a synthetic look-alike fixture built for CI.
+
+**Key layout facts (from the real PDFs):**
+- Combined statement: a "SIMPLY RIGHT CHECKING" section then a "SANTANDER SAVINGS" section.
+  This parser reads the **checking** section only (savings has ~zero activity; one job → one
+  `Statement`). Documented as a v1 scope decision in the parser module.
+- Native text always. Transaction table columns (Date | Description | Additions | Subtractions
+  | Balance) are read from the **x-position** of each amount token — the columns sit ~380 /
+  ~460 / ~520 pt from the left, wide gaps. Direction comes from which column the amount is in.
+- A negative (overdraft) balance prints as `-$92.38` — the sign is preserved.
+- Every row is cross-checked against the running balance; the parsed credit/debit totals are
+  cross-checked against the statement's own printed "Deposits/Credits" / "Withdrawals/Debits"
+  summary. A mismatch is a `ParserError` (a misread), not a `Statement` that fails to
+  reconcile.
+
+**New modules:**
+- `app/parsers/` — `base.py` (`ParsedStatement` / `ParsedTransaction` Pydantic models with
+  `Decimal` amounts, `ParserError`, the `Parser` protocol), `registry.py` (keyed by
+  `(bank, account_type, layout_version)`), `santander_checking_v1.py` (the module *is* the
+  parser — has the attributes + `detect` / `parse`). `__init__.py` imports each parser module
+  for its registration side effect.
+- `app/services/detection.py` — runs every registered parser's `detect()`, returns the best;
+  `CONFIDENCE_THRESHOLD = 0.70`, below → `UNSUPPORTED`.
+- `app/services/normalization.py` — the only DB writer for `Statement` / `Transaction` /
+  `Account`, and the only place `to_cents` is called (all conversions happen up front, before
+  any write, so a `SubCentPrecisionError` leaves nothing half-written). Resolves an `Account`
+  by `(bank, account_type, masked digits)`, reusing or creating.
+- `app/services/financial_validation.py` — three levels (structural / transaction-level /
+  reconciliation) → `VALID` / `WARNING` / `FAILED`. Reconciliation is `opening + Σcredits −
+  Σdebits == closing` exactly (integer cents, tolerance 0). Structural or reconciliation
+  failure → `FAILED`; a transaction dated outside the period alone → `WARNING`.
+
+**Schema / migration `69a3cd180f72`:**
+- `StatementJob.statement_id` nullable FK → `statement.id` (a completed job links to the
+  statement it produced; null for `FAILED` / `UNSUPPORTED` — REQ-VAL-005).
+- `uq_account_identity` unique constraint on `Account(bank, account_type,
+  account_identifier_masked)` (REQ-ACC-002 as a DB invariant). SQLite can't add a constraint
+  in place, so both changes use `batch_alter_table`.
+
+**Worker (`processor.py`) new flow:** `extract_text` → `detect` → below threshold →
+`mark_unsupported` (new, in `queue.py`; no attempt bump — it's not a failed attempt) → else
+`parse` → `normalize` → `validate_statement` → `mark_completed(statement_id=…)`. Error
+classification: `ExtractionFailedError` / `RetryableJobError` → retryable; `ParserError` /
+`SubCentPrecisionError` → non-retryable `FAILED`; anything else → `FAILED` + `logger.exception`.
+
+**Coordinator:** a batch whose completed jobs produced a `Statement` with `validation_result`
+in `{WARNING, FAILED}` → `COMPLETED_WITH_WARNINGS`, even when every job `COMPLETED`
+(REQ-VAL-003 / REQ-RPT-002).
+
+**API:** `GET /batches/{id}` gained a `statements` array (`id`, `bank`, `account_type`,
+`account_identifier_masked`, `extraction_status`, `validation_result`).
+
+**Test fixtures:** `tests/_pdf.py` gained `build_positioned_pdf()` — draws each token at an
+absolute (x, y), so a fixture can reproduce the real column geometry. `tests/_santander_sample.py`
+builds a synthetic 2-page Santander checking statement (10 transactions, a multi-line
+description, an overdraft, a savings section the parser must stop before) with `EXPECTED_*`
+constants and a `balanced=False` mode (parses fine, fails reconciliation). No real PDF or
+binary fixture is committed; the synthetic PDF is generated from a committed Python builder.
+
+**Existing tests adjusted:** the conftest `queued_job` / `intake_file` fixtures now use the
+Santander sample (so the happy path actually produces a `Statement`); `native_pdf_path` stays
+a generic minimal PDF and now represents the `UNSUPPORTED` case. Two existing job/API tests
+updated to assert the new end-to-end result.
+
+**Tests:** `uv run pytest` — **95 passed, 96% coverage** (gate 90%). New:
+`test_detection.py` (recognizes Santander incl. a mis-named file; a Chase statement / empty
+text / an unrelated PDF all below threshold), `test_santander_checking_v1.py` (golden parse of
+the synthetic: metadata, every transaction + direction, continuous running balance incl. the
+overdraft, multi-line description joined + `description_raw` verbatim, `source_page`, savings
+section not leaked, OCR rejected, missing summary → `ParserError`),
+`test_santander_local_golden.py` (parametrized over the 12 real PDFs — **runs and passes
+locally**, `skipif`-skips in CI), `test_normalization.py` (rows created, raw preserved,
+account reuse vs. separation, sub-cent rejected, PARTIAL), `test_financial_validation.py`
+(reconciling → VALID, missed debit → FAILED, out-of-period txn → WARNING, start>end → FAILED),
+plus `test_job_queue.py` extensions (low-confidence → `UNSUPPORTED` + zero statements,
+`ParserError` → `FAILED` + zero statements, unbalanced statement → job `COMPLETED` but
+`validation_result: FAILED` and batch `COMPLETED_WITH_WARNINGS`) and `test_batches_api.py`
+(`statements` in the response). `ruff check` / `ruff format --check` clean.
+
+**Manual end-to-end** against a real uvicorn server (lifespan worker running): `POST /batches`
+with two real Santander PDFs + one `.txt` → both jobs `COMPLETED` (`NATIVE`), two `Statement`
+rows `SUCCESS` / `VALID`, both resolved to **one** `Account` (masked `0520`), 245 `Transaction`
+rows, batch `COMPLETED_WITH_WARNINGS` (the `.txt` rejected at intake). DB grep confirmed the
+full account number `3576430520` appears **nowhere** — only the masked `0520`. All 12 real
+statements' running balances are continuous and reconcile exactly, and each month's closing
+balance equals the next month's opening.
+
+**Decisions recorded (mine, in `tasks/todo.md`):** checking-only for v1; detection threshold
+0.70; reconciliation exact; registry-driven detection; parser returns Pydantic, normalization
+is the sole DB writer; minimal account resolution (provisional/ambiguous handling REQ-ACC-003/004
+deferred — both `Should`).
+
+**Repo note:** branched off `main` (PR #8 was merged first). `build-plan.md` line for #6 was
+edited by the user to name Santander; `AGENTS.md` (a copy of `CLAUDE.md`'s workflow rules) was
+added by the user — both carried onto this branch, not authored here.
+
+**Next step:** build-plan.md #7 — deduplication and the deterministic analytics engine (first
+consumer of the now-populated canonical ledger).

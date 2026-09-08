@@ -138,112 +138,166 @@ refresh_batch(job.batch_id)
 ### 1. Fixtures scaffolding
 - [x] `apps/backend/tests/fixtures/statements/local/` created with `README.md` + `.gitkeep`
       (real PDFs there are covered by the existing repo-wide `*.pdf` ignore rule).
-- [ ] Extend `tests/_pdf.py` so it can build a multi-line, multi-page text PDF from arbitrary
+- [x] Extend `tests/_pdf.py` so it can build a multi-line, multi-page text PDF from arbitrary
       strings (current helper is a single fixed page). No new dependency.
-- [ ] `tests/fixtures/statements/santander_checking_v1.py`: `build_santander_sample() -> bytes`
+- [x] `tests/fixtures/statements/santander_checking_v1.py`: `build_santander_sample() -> bytes`
       plus `EXPECTED_*` constants — a synthetic Santander checking statement mirroring the real
       layout (header with bank name + masked account, statement period, beginning/ending
       balance, a deposits section and a withdrawals section, ~8–12 transactions that reconcile
       exactly). **Built after I've seen a real PDF** so the layout matches.
 
 ### 2. Parser contract — `app/parsers/base.py`
-- [ ] `ParsedTransaction` (Pydantic): `transaction_date`, `posted_date`, `description_raw`,
+- [x] `ParsedTransaction` (Pydantic): `transaction_date`, `posted_date`, `description_raw`,
       `description_normalized`, `amount: Decimal`, `direction`, `balance_after: Decimal | None`,
       `source_page`.
-- [ ] `ParsedStatement` (Pydantic): `bank`, `account_type`, `account_identifier_masked`,
+- [x] `ParsedStatement` (Pydantic): `bank`, `account_type`, `account_identifier_masked`,
       `statement_start_date`, `statement_end_date`, `opening_balance: Decimal`,
       `closing_balance: Decimal`, `parser_version`, `transactions: list[ParsedTransaction]`,
       `unreadable_pages: list[int]` (drives `extraction_status`).
-- [ ] `class ParserError(Exception)` — deterministic parse failure.
-- [ ] `Parser` `Protocol`: `parse(pages) -> ParsedStatement`, `detect(pages) -> float`,
+- [x] `class ParserError(Exception)` — deterministic parse failure.
+- [x] `Parser` `Protocol`: `parse(pages) -> ParsedStatement`, `detect(pages) -> float`,
       `parser_version: str`, registry key attributes.
 
 ### 3. Registry — `app/parsers/registry.py`
-- [ ] `PARSERS: dict[tuple[str, str, str], Parser]` keyed by `(bank, account_type, layout_version)`.
-- [ ] `register(parser)` and `get_parser(bank, account_type, layout_version) -> Parser`
+- [x] `PARSERS: dict[tuple[str, str, str], Parser]` keyed by `(bank, account_type, layout_version)`.
+- [x] `register(parser)` and `get_parser(bank, account_type, layout_version) -> Parser`
       (raises `KeyError` → caller turns that into `UNSUPPORTED`).
-- [ ] `all_parsers() -> list[Parser]` for detection to iterate.
+- [x] `all_parsers() -> list[Parser]` for detection to iterate.
 
 ### 4. Detection — `app/services/detection.py`
-- [ ] `DetectionResult` dataclass: `bank`, `account_type`, `layout_version`, `confidence`.
-- [ ] `detect(pages) -> DetectionResult`: run every parser's `detect`, return the best.
-- [ ] `CONFIDENCE_THRESHOLD = 0.70`.
+- [x] `DetectionResult` dataclass: `bank`, `account_type`, `layout_version`, `confidence`.
+- [x] `detect(pages) -> DetectionResult`: run every parser's `detect`, return the best.
+- [x] `CONFIDENCE_THRESHOLD = 0.70`.
 
 ### 5. Santander parser — `app/parsers/santander_checking_v1.py`
-- [ ] `detect(pages)`: weighted score over layout markers on page 1 (bank name, "Checking"
+- [x] `detect(pages)`: weighted score over layout markers on page 1 (bank name, "Checking"
       product marker, "Beginning Balance"/"Ending Balance", section headers). Tuned against the
       real PDFs.
-- [ ] `parse(pages)`: extract statement metadata + transactions. Section membership
+- [x] `parse(pages)`: extract statement metadata + transactions. Section membership
       (deposits/credits vs withdrawals/debits) sets `direction`. Dates parsed to `date`.
       Amounts kept as `Decimal`. `description_normalized` = whitespace-collapsed + trailing
       ref stripped. Anything that doesn't parse → `ParserError` (never a silent skip).
-- [ ] `register()` into the registry on import.
+- [x] `register()` into the registry on import.
 
 ### 6. Normalization — `app/services/normalization.py`
-- [ ] `normalize(session, parsed: ParsedStatement, *, batch_id) -> Statement`:
+- [x] `normalize(session, parsed: ParsedStatement, *, batch_id) -> Statement`:
       resolve/create `Account` by `(bank, account_type, account_identifier_masked)`; create the
       `Statement` (`extraction_status` = `PARTIAL` if `parsed.unreadable_pages` else `SUCCESS`,
       `validation_result=None`); create `Transaction` rows with `statement_id`, `account_id`,
       `source_page`, `source_bank`, `amount_cents` via `to_cents`.
-- [ ] `SubCentPrecisionError` propagates (caller marks the job `FAILED`).
-- [ ] Unique index on `Account (bank, account_type, account_identifier_masked)`.
+- [x] `SubCentPrecisionError` propagates (caller marks the job `FAILED`).
+- [x] Unique index on `Account (bank, account_type, account_identifier_masked)`.
 
 ### 7. Financial validation — `app/services/financial_validation.py`
-- [ ] `validate_statement(session, statement) -> str` returning `VALID` / `WARNING` / `FAILED`,
+- [x] `validate_statement(session, statement) -> str` returning `VALID` / `WARNING` / `FAILED`,
       running the three levels in decision 5. Pure read + arithmetic in integer cents; ratios
       never involved here.
-- [ ] Reconciliation compares `opening_balance_cents + Σcredit − Σdebit` to
+- [x] Reconciliation compares `opening_balance_cents + Σcredit − Σdebit` to
       `closing_balance_cents` exactly.
 
 ### 8. Wire into the worker
-- [ ] `app/workers/queue.py`: `mark_unsupported(session, job, reason)` (terminal, no attempt
+- [x] `app/workers/queue.py`: `mark_unsupported(session, job, reason)` (terminal, no attempt
       bump — it's not a failed attempt); `mark_completed` gains `statement_id`.
-- [ ] `app/models/jobs.py` + migration: `StatementJob.statement_id: str | None` FK.
-- [ ] `app/workers/processor.py`: the new flow above, with the error table's classification.
-- [ ] `app/workers/coordinator.py`: a batch whose completed jobs produced a `Statement` with
+- [x] `app/models/jobs.py` + migration: `StatementJob.statement_id: str | None` FK.
+- [x] `app/workers/processor.py`: the new flow above, with the error table's classification.
+- [x] `app/workers/coordinator.py`: a batch whose completed jobs produced a `Statement` with
       `validation_result` in `{WARNING, FAILED}` → `COMPLETED_WITH_WARNINGS` (REQ-VAL-003 /
       REQ-RPT-002), even when every job is `COMPLETED`.
 
 ### 9. API surface
-- [ ] `GET /batches/{batch_id}`: add a `statements` array — `{id, bank, account_type,
+- [x] `GET /batches/{batch_id}`: add a `statements` array — `{id, bank, account_type,
       account_identifier_masked, validation_result, extraction_status}` — so History/Review
       (#9) have the per-statement trust signal. `POST /batches` response unchanged.
 
 ### 10. Tests (coverage stays ≥ 90%; NFR-MAINT-001/002)
-- [ ] `test_detection.py`: synthetic Santander page → `confidence ≥ 0.70` with the right key;
+- [x] `test_detection.py`: synthetic Santander page → `confidence ≥ 0.70` with the right key;
       a non-Santander page → below threshold; empty/garbage text → below threshold.
-- [ ] `test_santander_checking_v1.py`: golden parse of the committed synthetic PDF → exact
+- [x] `test_santander_checking_v1.py`: golden parse of the committed synthetic PDF → exact
       expected transaction count, dates, amounts (cents), directions, opening/closing balances.
-- [ ] `test_santander_local_golden.py`: parametrized over
+- [x] `test_santander_local_golden.py`: parametrized over
       `tests/fixtures/statements/local/*.pdf`, `skipif` none present — your real golden test.
-- [ ] `test_normalization.py`: parsed → rows; **account reuse** (two statements, same masked
+- [x] `test_normalization.py`: parsed → rows; **account reuse** (two statements, same masked
       account → one `Account`); **account separation** (same bank, different masked digits →
       two `Account` rows, REQ-ACC-002); full account number never stored; `SubCentPrecisionError`
       surfaces.
-- [ ] `test_financial_validation.py` (NFR-MAINT-002): balanced statement → `VALID`;
+- [x] `test_financial_validation.py` (NFR-MAINT-002): balanced statement → `VALID`;
       one debit removed → reconciliation `FAILED`; a transaction dated outside the period →
       `WARNING`; a missing closing balance → structural `FAILED`.
-- [ ] extend `test_job_queue.py`: clean PDF → job `COMPLETED`, `statement_id` set, one
+- [x] extend `test_job_queue.py`: clean PDF → job `COMPLETED`, `statement_id` set, one
       `Statement` + N `Transaction` rows, `validation_result == "VALID"`; low-confidence detection
       → job `UNSUPPORTED`, **zero `Statement` rows** (REQ-VAL-005); `ParserError` → job `FAILED`,
       zero `Statement` rows; unbalanced statement → job `COMPLETED` but batch
       `COMPLETED_WITH_WARNINGS`.
-- [ ] extend `test_batches_api.py`: `GET /batches/{id}` shows the produced statement and its
+- [x] extend `test_batches_api.py`: `GET /batches/{id}` shows the produced statement and its
       `validation_result`.
-- [ ] Name tests with REQ IDs where natural (`test_req_det_002_*`, `test_req_val_001_*`, …).
+- [x] Name tests with REQ IDs where natural (`test_req_det_002_*`, `test_req_val_001_*`, …).
 
 ### 11. Checks
-- [ ] `uv run pytest` (coverage gate), `uv run ruff check .`, `uv run ruff format --check .`.
-- [ ] Full manual pass of `docs/manual-verification-santander.md` (happy path, UNSUPPORTED,
+- [x] `uv run pytest` (coverage gate), `uv run ruff check .`, `uv run ruff format --check .`.
+- [x] Full manual pass of `docs/manual-verification-santander.md` (happy path, UNSUPPORTED,
       reconciliation FAILED, multi-file isolation, account resolution, privacy/traceability).
 
 ### 12. Docs
-- [ ] `docs/activity.md` entry (append).
-- [ ] `README.md` "Status" / "Next up".
-- [ ] Update `requirements.md` §20 open item (first institution chosen) and §5/§8 if the
+- [x] `docs/activity.md` entry (append).
+- [x] `README.md` "Status" / "Next up".
+- [x] Update `requirements.md` §20 open item (first institution chosen) and §5/§8 if the
       detection threshold or tolerance should be recorded as spec — with your sign-off, since
       `requirements.md` edits need approval.
 
 ## Review
 
-_(filled in when the work is done)_
+### What was completed
+
+All 12 task groups. `app/parsers/` (base/registry/`santander_checking_v1`), three new
+services (`detection`, `normalization`, `financial_validation`), migration `69a3cd180f72`
+(`StatementJob.statement_id` FK + `uq_account_identity`), the rewritten `process_job` flow,
+the coordinator's validation-aware downgrade, and the `statements` array on
+`GET /batches/{id}`.
+
+The first parser was tuned against the 12 real Santander statements the user provided, then a
+synthetic look-alike fixture built for CI.
+
+### Deviations from the plan
+
+- **Synthetic fixture location.** `tests/_santander_sample.py` (a Python builder), not
+  `tests/fixtures/statements/santander_checking_v1.py`. Matches the existing `tests/_pdf.py`
+  convention and sidesteps the repo-wide `*.pdf` ignore rule. `tests/_pdf.py` gained
+  `build_positioned_pdf()` to place tokens at absolute (x, y).
+- **Direction comes from the amount's column x-position**, cross-checked against the
+  running-balance delta — not from section headers (the real statements interleave credits and
+  debits in one "Account Activity" table, not separate deposit/withdrawal sections).
+- **Parser scope: checking only.** The real PDFs are combined checking + savings statements;
+  the savings section is deliberately not parsed (documented in the module). One job → one
+  `Statement`.
+- **`test_financial_validation` structural case** is `start_date > end_date → FAILED`, not
+  "missing closing balance" — the balance columns are `NOT NULL`, so they can't be missing.
+- **conftest fixture change.** `queued_job` / `intake_file` now use the Santander sample so
+  the happy path produces a real `Statement`; `native_pdf_path` stays generic and is now the
+  `UNSUPPORTED` case. Two pre-existing job/API tests updated accordingly.
+- **`normalize` converts all amounts to cents before any DB write**, so a
+  `SubCentPrecisionError` leaves nothing half-written (the plan implied a straight-through
+  loop).
+
+### Tests performed
+
+`uv run pytest` — **95 passed, 96% coverage** (gate 90%). `ruff check` / `ruff format --check`
+clean. `test_santander_local_golden.py` — **12 passed** against the real PDFs locally
+(skips in CI). Manual end-to-end against a live uvicorn server: two real Santander PDFs + a
+`.txt` → both jobs `COMPLETED` (`NATIVE`), two `Statement` rows `VALID`, one `Account`
+(`0520`), 245 `Transaction` rows, batch `COMPLETED_WITH_WARNINGS`; DB grep confirmed the full
+account number is stored nowhere.
+
+### Known issues / follow-ups
+
+- `apps/backend/src/app/workers/pool.py` still has the pre-existing uncovered defensive
+  branches (build-plan #5's known gap) — total coverage unaffected.
+- The two OCR extraction tests still need `C:\Program Files\Tesseract-OCR` on PATH locally
+  (build-plan #4 quirk; CI installs it).
+- Raw PDF deletion after processing (REQ-CLEAN-001) is still not wired — not in #6 scope.
+- `requirements.md` §5/§8 could record the 0.70 detection threshold and the 0-cent
+  reconciliation tolerance as spec; left for a docs pass with the user's sign-off.
+
+### Recommended next step
+
+Merge this branch's PR, then build-plan #7 — deduplication + the deterministic analytics
+engine, the first consumer of the now-populated canonical ledger.

@@ -58,12 +58,29 @@ def claim_next_job(session: Session) -> StatementJob | None:
 
 
 def mark_completed(
-    session: Session, job: StatementJob, *, method: str, page_count: int
+    session: Session,
+    job: StatementJob,
+    *,
+    method: str,
+    page_count: int,
+    statement_id: str | None = None,
 ) -> None:
     job.status = "COMPLETED"
     job.extraction_method = method
     job.page_count = page_count
+    job.statement_id = statement_id
     job.failure_reason = None
+    job.updated_at = _utcnow()
+    session.add(job)
+    session.commit()
+
+
+def mark_unsupported(session: Session, job: StatementJob, reason: str) -> None:
+    """Detection confidence was below threshold (REQ-DET-002). Terminal, and not
+    a failed attempt -- the file was read fine, we just don't have a parser for
+    it, so `attempt_count` is left alone."""
+    job.status = "UNSUPPORTED"
+    job.failure_reason = reason
     job.updated_at = _utcnow()
     session.add(job)
     session.commit()
