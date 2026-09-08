@@ -33,9 +33,14 @@ Transient failures retry twice; a parse error or a sub-cent misread fails the jo
 produced a statement that doesn't reconcile. `GET /batches/{id}` reports batch counters, per-job
 status, and the produced statements with their validation result.
 
-Next up is deduplication and the deterministic analytics engine (`build-plan.md` #7). Progress
-is logged in [`docs/activity.md`](./docs/activity.md), and written up for humans as a build log
-at [kervintznoel.com/posts](https://kervintznoel.com/posts/build-log-1-a-window-that-says-ok).
+When a batch finishes, its new statements are checked for duplicates — statement-level (the
+same PDF uploaded twice, auto-collapsed) then transaction-level for partial overlaps (a "last
+90 days" statement overlapping monthly ones). Nothing is ever deleted: a duplicate row keeps
+its place and is excluded from the ledger, and anything ambiguous is flagged for Review
+(`GET /review/duplicates`) rather than collapsed. The deterministic analytics engine over that
+deduplicated ledger is next (`build-plan.md` #7, part 2). Progress is logged in
+[`docs/activity.md`](./docs/activity.md), and written up for humans as a build log at
+[kervintznoel.com/posts](https://kervintznoel.com/posts/build-log-1-a-window-that-says-ok).
 
 ## What it does (v1)
 

@@ -1,5 +1,6 @@
 from app.models.canonical import (
     BATCH_STATUSES,
+    DEDUP_STATUSES,
     DIRECTIONS,
     EXTRACTION_STATUSES,
     VALIDATION_RESULTS,
@@ -20,6 +21,7 @@ from app.models.money import SubCentPrecisionError, to_cents, to_decimal
 __all__ = [
     "BATCH_STATUSES",
     "CLAIMABLE_JOB_STATUSES",
+    "DEDUP_STATUSES",
     "DIRECTIONS",
     "EXTRACTION_STATUSES",
     "INTAKE_FILE_STATUSES",

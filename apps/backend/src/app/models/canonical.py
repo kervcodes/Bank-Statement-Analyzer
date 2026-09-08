@@ -19,6 +19,10 @@ BATCH_STATUSES = ("PROCESSING", "COMPLETED", "COMPLETED_WITH_WARNINGS", "FAILED"
 EXTRACTION_STATUSES = ("SUCCESS", "PARTIAL")
 VALIDATION_RESULTS = ("VALID", "WARNING", "FAILED")
 DIRECTIONS = ("DEBIT", "CREDIT")
+# Deduplication outcome (REQ-DEDUP-003), on both Statement and Transaction.
+# DUPLICATE = auto-collapsed, excluded from the ledger. POSSIBLE_DUPLICATE =
+# ambiguous, kept and flagged for Review (REQ-DEDUP-004: never a silent delete).
+DEDUP_STATUSES = ("UNIQUE", "DUPLICATE", "POSSIBLE_DUPLICATE")
 
 
 def _in_list(column: str, values: tuple[str, ...]) -> str:
@@ -113,11 +117,16 @@ class Statement(SQLModel, table=True):
             + _in_list("validation_result", VALIDATION_RESULTS),
             name="ck_statement_validation_result",
         ),
+        CheckConstraint(
+            _in_list("dedup_status", DEDUP_STATUSES),
+            name="ck_statement_dedup_status",
+        ),
     )
 
     id: str = Field(default_factory=_uuid, primary_key=True)
     batch_id: str = Field(foreign_key="batch.id", index=True)
     account_id: str | None = Field(default=None, foreign_key="account.id", index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
     bank: str
     account_type: str
     account_identifier_masked: str
@@ -129,6 +138,11 @@ class Statement(SQLModel, table=True):
     extraction_status: str
     # Null until financial validation has run (build-plan #6).
     validation_result: str | None = None
+    # Deduplication (build-plan #7). Set when the batch finishes processing.
+    dedup_status: str = "UNIQUE"
+    duplicate_of_id: str | None = Field(
+        default=None, foreign_key="statement.id", index=True
+    )
 
     batch: Batch = Relationship(back_populates="statements")
     account: Account | None = Relationship(back_populates="statements")
@@ -153,6 +167,10 @@ class Transaction(SQLModel, table=True):
             _in_list("direction", DIRECTIONS), name="ck_transaction_direction"
         ),
         CheckConstraint("amount_cents >= 0", name="ck_transaction_amount_non_negative"),
+        CheckConstraint(
+            _in_list("dedup_status", DEDUP_STATUSES),
+            name="ck_transaction_dedup_status",
+        ),
     )
 
     id: str = Field(default_factory=_uuid, primary_key=True)
@@ -169,6 +187,14 @@ class Transaction(SQLModel, table=True):
     source_bank: str
     extraction_confidence: float | None = None
     source_page: int
+    # A statement-provided reference / confirmation number, when the parser
+    # extracts one (REQ-DEDUP-002). None for santander_checking_v1 so far.
+    reference_id: str | None = None
+    # Deduplication (build-plan #7).
+    dedup_status: str = "UNIQUE"
+    duplicate_of_id: str | None = Field(
+        default=None, foreign_key="transaction.id", index=True
+    )
 
     statement: Statement = Relationship(back_populates="transactions")
     account: Account | None = Relationship(back_populates="transactions")

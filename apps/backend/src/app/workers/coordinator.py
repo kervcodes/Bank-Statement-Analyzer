@@ -9,6 +9,7 @@ counts each time.
 from sqlmodel import Session, col, func, select
 
 from app.models import TERMINAL_JOB_STATUSES, Batch, Statement, StatementJob
+from app.services.deduplication import run_dedup_for_batch
 
 
 def refresh_batch(session: Session, batch_id: str) -> None:
@@ -48,6 +49,14 @@ def refresh_batch(session: Session, batch_id: str) -> None:
     excluded = (
         failed + batch.validation_failed + batch.upload_failed + flagged_statements
     )
+    first_completion = batch.status == "PROCESSING"
     batch.status = "COMPLETED" if excluded == 0 else "COMPLETED_WITH_WARNINGS"
     session.add(batch)
     session.commit()
+
+    # Dedup runs once, the first time the batch reaches a terminal state: it
+    # checks this batch's new statements against the existing ledger (build-plan
+    # #7). It does not change the batch status -- a re-uploaded duplicate is
+    # expected, not a warning; possible duplicates surface in Review instead.
+    if first_completion:
+        run_dedup_for_batch(session, batch_id)

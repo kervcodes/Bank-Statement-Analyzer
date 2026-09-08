@@ -7,10 +7,10 @@ processing job for every accepted file (REQ-PROC-002/004). The background worker
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
-from sqlmodel import Session, col, select
+from sqlmodel import Session, col, func, select
 
 from app.db import DATA_DIR, get_db_session
-from app.models import Batch, IntakeFile, Statement, StatementJob
+from app.models import Batch, IntakeFile, Statement, StatementJob, Transaction
 from app.services.intake_validation import validate_pdf
 from app.workers.queue import enqueue_job
 
@@ -50,6 +50,7 @@ class StatementSummary(BaseModel):
     account_identifier_masked: str
     extraction_status: str
     validation_result: str | None = None
+    dedup_status: str
 
 
 class BatchStatusResponse(BaseModel):
@@ -61,6 +62,7 @@ class BatchStatusResponse(BaseModel):
     validation_failed: int
     processed: int
     processing_failed: int
+    possible_duplicate_count: int
     jobs: list[JobStatus]
     statements: list[StatementSummary]
 
@@ -196,6 +198,14 @@ def get_batch(
         .order_by(col(Statement.statement_start_date))
     ).all()
 
+    possible_duplicate_count = session.exec(
+        select(func.count())
+        .select_from(Transaction)
+        .join(Statement, col(Transaction.statement_id) == col(Statement.id))
+        .where(col(Statement.batch_id) == batch_id)
+        .where(col(Transaction.dedup_status) == "POSSIBLE_DUPLICATE")
+    ).one()
+
     return BatchStatusResponse(
         batch_id=batch.id,
         status=batch.status,
@@ -205,6 +215,7 @@ def get_batch(
         validation_failed=batch.validation_failed,
         processed=batch.processed,
         processing_failed=batch.processing_failed,
+        possible_duplicate_count=possible_duplicate_count,
         jobs=[
             JobStatus(
                 id=j.id,
@@ -223,6 +234,7 @@ def get_batch(
                 account_identifier_masked=s.account_identifier_masked,
                 extraction_status=s.extraction_status,
                 validation_result=s.validation_result,
+                dedup_status=s.dedup_status,
             )
             for s in statements
         ],
