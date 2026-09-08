@@ -1,243 +1,249 @@
-# Todo: Build-plan #5 — Background job queue
+# Todo: Build-plan #6 — First bank parser, end to end (Santander checking)
 
-Source: `build-plan.md` §5, tracing to `requirements.md` §3 (REQ-PROC-001 through 103) and
-`techstack.md` §6.
+Source: `build-plan.md` §6, tracing to `requirements.md` §5 (REQ-DET-001..004), §6
+(REQ-NORM-001..006), §7 (REQ-ACC-001..002), §8 (REQ-VAL-001..005), and NFR-MAINT-001/002.
 
 ## Goal (what "done" means for this step)
 
-An upload to `POST /batches` creates one `statement_job` per accepted file, a background worker
-picks each job up and runs it through the extraction pipeline from build-plan #4
-(`extract_text()`), retries retryable failures up to 2 times, and a `BatchCoordinator` flips the
-batch to `COMPLETED` / `COMPLETED_WITH_WARNINGS` once every job reaches a terminal state — end
-to end, no manual step.
+A real Santander checking PDF dropped into `POST /batches` is picked up by the background
+worker, its bank/account-type/layout is detected from the **text content** with a confidence
+score, a versioned `santander_checking_v1` parser normalizes it into the canonical schema, the
+three-level financial validation runs, and the result is a `Statement` row + `Transaction` rows
++ a resolved `Account` row with `validation_result` set — or, if detection confidence is below
+threshold, the job ends `UNSUPPORTED` and **no `Statement` row is created** (REQ-VAL-005).
 
-**Not in scope** (later build-plan steps): bank detection, parsers, `Statement` rows,
-normalization, financial validation, analytics. At this step a "COMPLETED" job means *the PDF's
-text was extracted*, nothing more. `UNSUPPORTED` is in the status enum (REQ-PROC-002) but is
-not reachable until build-plan #6 adds detection — it's carried now so the schema doesn't
-change again then.
+This is the milestone where a real PDF goes in and a validated, normalized statement comes out.
+
+**Not in scope** (later steps): deduplication and analytics (#7), categorization + merchant
+normalization + Privacy Gateway + LLM (#8), all frontend screens (#9), packaging (#10),
+provisional/ambiguous account handling (REQ-ACC-003/004, both `Should`), parsers for any other
+institution.
 
 ## State of the repo right now
 
-- Branch `feature/extraction-pipeline` (build-plan #4) is **PR #7, still open**, CI green,
-  mergeable. `main` is at build-plan #3.
-- `IntakeFile` rows with `status="ACCEPTED"` and a `temp_path` already exist after intake
-  (build-plan #3). This step reads those.
-- `extract_text(pdf_path) -> ExtractionResult` exists and raises `ExtractionFailedError` on OCR
-  failure (build-plan #4).
-- `Batch` already has counter columns: `processed`, `processing_failed` (currently only ever 0).
-- `db.py` registers an `Engine`-level connect listener (currently just `PRAGMA foreign_keys=ON`).
-- Bare `TestClient(app)` is used in tests — FastAPI lifespan events do **not** fire, so a
-  lifespan-started worker stays off during tests automatically.
+- Build-plan #5 is **PR #8, open** (CI green, mergeable). `main` is at build-plan #4.
+- `process_job` (`app/workers/processor.py`) currently: `extract_text()` → `mark_completed`.
+  This step inserts detection → parse → normalize → validate between those.
+- `RetryableJobError` hook exists in `processor.py`, unused so far — #6 is its first real user.
+- `UNSUPPORTED` is in `JOB_STATUSES` / `TERMINAL_JOB_STATUSES` but nothing produces it yet —
+  #6 is the first producer.
+- `Statement` / `Transaction` / `Account` SQLModel tables already exist with all needed fields
+  (`validation_result` nullable, money as integer cents, `source_page`, `parser_version`, …).
+- No sample statements in the repo. No `parsers/` or detection/normalization/validation
+  modules yet.
 
-## Step 0 — merge PR #7 first (recommended, your call)
+## Step 0 — merge PR #8 first (recommended)
 
-The last two times PRs were stacked on feature branches instead of `main`, `main` silently fell
-behind and needed a catch-up PR (#4). To avoid a repeat: **merge PR #7 now**, then this work
-branches off an updated `main`. If you'd rather not, I'll base `feature/job-queue` on
-`feature/extraction-pipeline` and it becomes a stacked PR — workable, just needs care at merge
-time.
+Same reasoning as last step: stacked PRs on feature branches have twice left `main` behind.
+Merge PR #8, then branch `feature/santander-parser` off an updated `main`. If you'd rather not,
+I stack it on `feature/job-queue`.
 
 ## Decisions to confirm before I write code
 
-**1. Worker concurrency model.** `techstack.md` §6 specifies
-`concurrent.futures.ProcessPoolExecutor` (OCR/parsing are CPU-bound). For this step I recommend
-**deviating to a single background thread running a sequential poll loop**:
-  - The queue/retry/coordinator *machinery* is what #5 is about, and it's identical either way.
-  - `ProcessPoolExecutor` on Windows uses `spawn` — every job argument and the work function
-    must be picklable, child processes each need their own DB engine, and it makes the test
-    suite genuinely painful and flaky.
-  - Throughput isn't a real problem yet (no measured slow batch, no parsers).
-  - Revisit to a process pool in a later step *if* OCR throughput becomes a measured
-    bottleneck — it's a change contained to one module (`workers/pool.py`).
+1. **First parser: `santander_checking_v1`** — confirmed. Registry key
+   `("Santander", "checking", "v1")`.
 
-  Alternative if you want to stay closer to the spec: `ThreadPoolExecutor` with 2 workers (I/O
-  during extraction releases the GIL; CPU-bound OCR won't parallelize, but the retry/coordinator
-  race handling gets exercised properly). Say which you want.
+2. **Detection is registry-driven.** Each parser module exposes
+   `detect(pages: list[PageText]) -> float` (0.0–1.0). `services/detection.py` runs every
+   registered parser's `detect`, picks the highest, and returns
+   `DetectionResult(bank, account_type, layout_version, confidence)`. Keeps layout-specific
+   matching next to the parser that owns that layout (REQ-DET-001/003).
 
-**2. Extracted text is not persisted at this step.** The job runs `extract_text()`, records
-`extraction_method` (`NATIVE`/`OCR`) and `page_count` on the job row for observability, then
-marks `COMPLETED`. It does **not** store the page text — build-plan #6's parser pipeline
-re-runs extraction as its first step (extraction of native text is cheap; OCR is the rare
-case). Keeps this step from growing a text-storage/cleanup concern that belongs with #6.
-Confirm, or say you'd rather cache the text on the job now.
+3. **Confidence threshold = 0.70.** `confidence < 0.70` → job `UNSUPPORTED`, no `Statement`
+   (REQ-DET-002, REQ-VAL-005). A confidently-wrong parser is worse than a clear "unsupported".
 
-**3. SQLite concurrency pragmas.** Once a background writer exists alongside request handlers,
-concurrent writes to one SQLite file produce `database is locked`. I'll add
-`PRAGMA journal_mode=WAL` and `PRAGMA busy_timeout=5000` to the existing connect listener in
-`db.py`. Standard for this exact setup, low risk. Confirm.
+4. **Reconciliation tolerance = exact (0 cents).** `opening + Σcredits − Σdebits == closing`
+   exactly → the reconciliation level passes. Any nonzero difference → that level `FAILED`.
+   Money is integer cents and a correct parse of a correct statement reconciles exactly; a
+   mismatch means a missed or misread line, which is exactly what this app exists to catch.
+   (If real Santander statements turn out to carry a legitimate sub-cent interest rounding
+   line, I'll bring back a small configurable tolerance and flag it — not assumed up front.)
 
-**4. New read endpoint `GET /batches/{batch_id}`.** Returns the batch counters, status, and a
-per-job status list. Needed to verify "end to end" here and it's what build-plan #9's History /
-progress screens (TanStack Query polling, `techstack.md` §3) will call. Small and thin.
-Confirm.
+5. **Three validation levels → one `validation_result`:**
+   - **structural** (required fields present: both dates, both balances, `parser_version`,
+     ≥1 transaction) fails → `FAILED`.
+   - **transaction-level** (each txn: date within statement period, `amount_cents ≥ 0`,
+     `direction ∈ {DEBIT,CREDIT}`, non-empty description) fails → `WARNING` (the numbers may
+     still reconcile; the statement is usable but flagged).
+   - **reconciliation** (decision 4) fails → `FAILED`.
+   - all pass → `VALID`.
+   Written to `Statement.validation_result`. `extraction_status` stays `SUCCESS` unless the
+   parser explicitly reports pages it could not read (`PARTIAL`).
 
-**5. Worker auto-starts via FastAPI lifespan** in dev/packaged runs; stays off under the test
-suite's bare `TestClient(app)`. Tests drive the worker explicitly by calling
-`run_worker_once()` / `process_job()`. Confirm.
+6. **Minimal account resolution now.** `services/normalization.py` resolves an `Account` by
+   `(bank, account_type, account_identifier_masked)` — reuse if it exists, create if not
+   (REQ-ACC-001: never store the full number; REQ-ACC-002: two accounts at one bank stay
+   separate). Add a unique index on those three columns. Ambiguous-match → provisional account
+   for user confirmation (REQ-ACC-003/004) is deferred — both are `Should`.
 
-## Retry classification (REQ-PROC-101 / 102)
+7. **`StatementJob` gains `statement_id: str | None`** (nullable FK → `statement.id`), so a
+   completed job links to the statement it produced and a `FAILED`/`UNSUPPORTED` job clearly
+   produced none (REQ-VAL-005). One autogenerated migration.
 
-- `ExtractionFailedError` from build-plan #4 → **retryable** (it wraps OCR-engine failures, a
-  corrupt render, a missing binary — the "worker crash / OCR timeout" class in REQ-PROC-101).
-  Retried up to 2 times (3 attempts total), then → `FAILED`.
-- Deterministic failures (corrupted / password-protected / non-PDF) are already filtered out at
-  intake (build-plan #3), so no deterministic-failure path is reachable from extraction alone
-  yet. The classification hook (`RetryableJobError` vs letting other exceptions fall through to
-  a non-retried `FAILED`) is put in place now for build-plan #6 to use.
-- An unexpected exception (not `ExtractionFailedError`) → non-retryable `FAILED`, logged. Not
-  swallowed.
+8. **Parser returns Pydantic models, not DB rows.** `parsers/base.py` defines
+   `ParsedStatement` / `ParsedTransaction` (plain Pydantic, amounts as `Decimal`). The parser
+   never touches the DB; `normalization.py` is the only thing that writes rows and the only
+   place `to_cents` is called (so `SubCentPrecisionError` is caught in one place). Matches the
+   techstack.md §9 split between the canonical Pydantic shape and the storage models.
 
-## Job state machine
+9. **`description_normalized` = light cleanup only** at this step: collapse whitespace, strip a
+   trailing reference/confirmation number. Real merchant normalization ("UBER *TRIP" → "Uber")
+   is build-plan #8. `description_raw` is stored verbatim and never overwritten (REQ-NORM-002).
+
+10. **Real PDFs never enter the repo.** `apps/backend/tests/fixtures/statements/local/` holds
+    your real Santander PDFs — `*.pdf` is already gitignored repo-wide, so only the folder's
+    `README.md` / `.gitkeep` are tracked. The committed synthetic fixture is a **Python
+    builder** (`tests/fixtures/statements/santander_checking_v1.py` → `build_santander_sample()
+    -> bytes` plus expected-value constants), not a checked-in binary — matches how
+    `tests/_pdf.py` already works and sidesteps the `*.pdf` ignore rule. A golden-file test
+    against `local/*.pdf` runs when the files are present and is `skipif`-skipped otherwise.
+
+## Error classification (extends build-plan #5's table)
+
+| Failure | Job outcome | Retryable? |
+|---|---|---|
+| `ExtractionFailedError` (OCR engine, bad render, missing binary) | `RETRYING` → `FAILED` | yes (×2) |
+| Detection `confidence < 0.70` | `UNSUPPORTED` | no — deterministic |
+| `ParserError` (layout matched, a field/line could not be parsed) | `FAILED` | no — deterministic |
+| `SubCentPrecisionError` during normalization | `FAILED` | no — misread, not transient |
+| `RetryableJobError` (parser explicitly signals transient) | `RETRYING` → `FAILED` | yes (×2) |
+| any other exception | `FAILED` + `logger.exception` | no |
+
+A statement that parses cleanly but fails **validation** is still a `COMPLETED` job with a
+`Statement` row — `validation_result` carries the bad news, and the batch coordinator downgrades
+the batch to `COMPLETED_WITH_WARNINGS` (decision below). Validation failure is not a job failure.
+
+## New processing flow (`process_job`)
 
 ```
-QUEUED ──claim──► PROCESSING ──success──────► COMPLETED   (terminal)
-                       │
-                       ├─ retryable fail, attempts left ─► RETRYING ──re-queue──► (claimable)
-                       │
-                       ├─ retryable fail, no attempts ───► FAILED       (terminal)
-                       │
-                       └─ non-retryable fail ────────────► FAILED       (terminal)
-
-(UNSUPPORTED: terminal, not produced until build-plan #6)
+extract_text(pdf)                      # unchanged; ExtractionFailedError → retryable
+      ↓
+detect(pages)                          # services/detection.py
+      ↓  confidence < 0.70  ──►  mark_unsupported(job, reason) ──► refresh_batch ──► return
+      ↓
+parser = get_parser(bank, account_type, layout_version)   # parsers/registry.py
+parsed = parser.parse(pages)           # ParserError → FAILED (non-retryable)
+      ↓
+statement = normalize(session, parsed, batch_id=job.batch_id)   # Statement + Transactions + Account
+      ↓
+statement.validation_result = validate_statement(session, statement)   # services/financial_validation.py
+      ↓
+mark_completed(job, method=..., page_count=..., statement_id=statement.id)
+      ↓
+refresh_batch(job.batch_id)
 ```
-
-`RETRYING` rows are claimable alongside `QUEUED` (claimer picks `status IN ('QUEUED','RETRYING')`).
-Claiming is one atomic `UPDATE ... WHERE id = ? AND status IN (...)` returning rowcount, so two
-workers can't grab the same job.
 
 ## Tasks
 
-### 1. Model + migration
-- [x] `app/models/jobs.py`: `StatementJob` SQLModel (`statement_job` table) + `JOB_STATUSES`
-      tuple + CHECK constraint, matching the `canonical.py` / `intake.py` precedent.
-      Fields: `id`, `batch_id` (FK, indexed), `intake_file_id` (FK → `intake_file.id`, indexed),
-      `pdf_path` (str — the reference, REQ-PROC-003: never the bytes), `status` (default
-      `QUEUED`), `attempt_count` (default 0), `max_attempts` (default 3), `failure_reason`
-      (nullable), `extraction_method` (nullable), `page_count` (nullable), `created_at`,
-      `updated_at`.
-- [x] Export from `app/models/__init__.py`; add to `alembic/env.py`'s model import line.
-- [x] `uv run alembic revision --autogenerate -m "add statement_job table"`, review the
-      generated migration (fix the known `sqlmodel.sql.sqltypes` import gap if it recurs),
-      `uv run alembic upgrade head`.
+### 1. Fixtures scaffolding
+- [x] `apps/backend/tests/fixtures/statements/local/` created with `README.md` + `.gitkeep`
+      (real PDFs there are covered by the existing repo-wide `*.pdf` ignore rule).
+- [ ] Extend `tests/_pdf.py` so it can build a multi-line, multi-page text PDF from arbitrary
+      strings (current helper is a single fixed page). No new dependency.
+- [ ] `tests/fixtures/statements/santander_checking_v1.py`: `build_santander_sample() -> bytes`
+      plus `EXPECTED_*` constants — a synthetic Santander checking statement mirroring the real
+      layout (header with bank name + masked account, statement period, beginning/ending
+      balance, a deposits section and a withdrawals section, ~8–12 transactions that reconcile
+      exactly). **Built after I've seen a real PDF** so the layout matches.
 
-### 2. Queue repository — `app/workers/queue.py`
-- [x] `enqueue_job(session, *, batch_id, intake_file_id, pdf_path) -> StatementJob`
-- [x] `claim_next_job(session) -> StatementJob | None` — atomic claim, sets `PROCESSING`
-- [x] `mark_completed(session, job, *, method, page_count)`
-- [x] `mark_failed(session, job, reason)`
-- [x] `record_retryable_failure(session, job, reason)` — increments `attempt_count`; sets
-      `RETRYING` (re-queue) if `attempt_count < max_attempts`, else `FAILED`
-- [x] Pure DB functions, no FastAPI imports, no extraction imports.
+### 2. Parser contract — `app/parsers/base.py`
+- [ ] `ParsedTransaction` (Pydantic): `transaction_date`, `posted_date`, `description_raw`,
+      `description_normalized`, `amount: Decimal`, `direction`, `balance_after: Decimal | None`,
+      `source_page`.
+- [ ] `ParsedStatement` (Pydantic): `bank`, `account_type`, `account_identifier_masked`,
+      `statement_start_date`, `statement_end_date`, `opening_balance: Decimal`,
+      `closing_balance: Decimal`, `parser_version`, `transactions: list[ParsedTransaction]`,
+      `unreadable_pages: list[int]` (drives `extraction_status`).
+- [ ] `class ParserError(Exception)` — deterministic parse failure.
+- [ ] `Parser` `Protocol`: `parse(pages) -> ParsedStatement`, `detect(pages) -> float`,
+      `parser_version: str`, registry key attributes.
 
-### 3. Processor — `app/workers/processor.py`
-- [x] `class RetryableJobError(Exception)` — the classification hook #6 will raise from parser
-      code.
-- [x] `process_job(session, job) -> None`: load the PDF path, call `extract_text()`, on success
-      `mark_completed`; on `ExtractionFailedError` / `RetryableJobError` →
-      `record_retryable_failure`; on any other exception → `mark_failed` + `logger.exception`.
-- [x] After every terminal or retry transition, call `BatchCoordinator.refresh(session,
-      batch_id)`.
+### 3. Registry — `app/parsers/registry.py`
+- [ ] `PARSERS: dict[tuple[str, str, str], Parser]` keyed by `(bank, account_type, layout_version)`.
+- [ ] `register(parser)` and `get_parser(bank, account_type, layout_version) -> Parser`
+      (raises `KeyError` → caller turns that into `UNSUPPORTED`).
+- [ ] `all_parsers() -> list[Parser]` for detection to iterate.
 
-### 4. Batch coordinator — `app/workers/coordinator.py`
-- [x] `refresh(session, batch_id)`: in one transaction, count that batch's jobs by status.
-      While any job is non-terminal → leave batch `PROCESSING`. Once all terminal:
-      set `batch.processed` = COMPLETED job count, `batch.processing_failed` = FAILED +
-      UNSUPPORTED count, and `batch.status`:
-        - `COMPLETED` if `processing_failed == 0` **and** `validation_failed == 0` **and**
-          `upload_failed == 0` (REQ-RPT-002: any exclusion at all → warnings)
-        - `COMPLETED_WITH_WARNINGS` otherwise
-- [x] Idempotent — safe to call repeatedly and from concurrent workers.
+### 4. Detection — `app/services/detection.py`
+- [ ] `DetectionResult` dataclass: `bank`, `account_type`, `layout_version`, `confidence`.
+- [ ] `detect(pages) -> DetectionResult`: run every parser's `detect`, return the best.
+- [ ] `CONFIDENCE_THRESHOLD = 0.70`.
 
-### 5. Worker runner — `app/workers/pool.py`
-- [x] `run_worker_once(session_factory) -> bool`: claim one job, process it, return whether one
-      ran. This is the unit tests drive.
-- [x] `run_worker_loop(stop_event)`: poll `run_worker_once` on a short sleep until stopped.
-- [x] `start_background_worker()` / `stop_background_worker()`: spawn/join the daemon thread.
-- [x] Wire into a FastAPI `lifespan` in `app/main.py` (replacing the bare `app = FastAPI()`).
+### 5. Santander parser — `app/parsers/santander_checking_v1.py`
+- [ ] `detect(pages)`: weighted score over layout markers on page 1 (bank name, "Checking"
+      product marker, "Beginning Balance"/"Ending Balance", section headers). Tuned against the
+      real PDFs.
+- [ ] `parse(pages)`: extract statement metadata + transactions. Section membership
+      (deposits/credits vs withdrawals/debits) sets `direction`. Dates parsed to `date`.
+      Amounts kept as `Decimal`. `description_normalized` = whitespace-collapsed + trailing
+      ref stripped. Anything that doesn't parse → `ParserError` (never a silent skip).
+- [ ] `register()` into the registry on import.
 
-### 6. Wire intake → queue — `app/api/batches.py`
-- [x] After an `IntakeFile` is written as `ACCEPTED`, `enqueue_job(...)` for it.
-- [x] Batch starts `PROCESSING` when ≥1 job was queued (unchanged), `FAILED` when 0 accepted
-      (unchanged — no jobs, nothing to coordinate).
-- [x] `GET /batches/{batch_id}` → `{batch fields, jobs: [{id, status, attempt_count,
-      failure_reason, extraction_method}]}`; 404 when unknown.
+### 6. Normalization — `app/services/normalization.py`
+- [ ] `normalize(session, parsed: ParsedStatement, *, batch_id) -> Statement`:
+      resolve/create `Account` by `(bank, account_type, account_identifier_masked)`; create the
+      `Statement` (`extraction_status` = `PARTIAL` if `parsed.unreadable_pages` else `SUCCESS`,
+      `validation_result=None`); create `Transaction` rows with `statement_id`, `account_id`,
+      `source_page`, `source_bank`, `amount_cents` via `to_cents`.
+- [ ] `SubCentPrecisionError` propagates (caller marks the job `FAILED`).
+- [ ] Unique index on `Account (bank, account_type, account_identifier_masked)`.
 
-### 7. Tests — `tests/test_job_queue.py`, extend `tests/test_batches_api.py`
-- [x] `conftest.py`: a `job`/`queued_job` fixture; a synthetic native-text PDF helper (reuse
-      the hand-built-PDF approach from `test_extraction.py` — move it to `conftest.py` or a
-      small `tests/_pdf.py` helper rather than duplicating).
-- [x] Happy path: enqueue → `run_worker_once` → job `COMPLETED`, `extraction_method == "NATIVE"`.
-- [x] `claim_next_job` returns `None` on an empty queue; claims exactly one when two are queued;
-      a claimed job is not re-claimable (simulates two workers).
-- [x] Retry: monkeypatch `extract_text` to raise `ExtractionFailedError` →
-      first two failures leave the job `RETRYING` with rising `attempt_count`, third →
-      `FAILED`. (REQ-PROC-101, and NFR-MAINT-002 calls out retry-state transitions as a
-      must-test area.)
-- [x] Non-retryable: monkeypatch `extract_text` to raise `ValueError` → job `FAILED`
-      immediately, `attempt_count == 1`, no retry.
-- [x] Coordinator: batch with 2 jobs stays `PROCESSING` until both terminal; 2×COMPLETED →
-      `COMPLETED`; 1 COMPLETED + 1 FAILED → `COMPLETED_WITH_WARNINGS`; a batch that also had an
-      intake `validation_failed` and 1 COMPLETED job → `COMPLETED_WITH_WARNINGS`.
-- [x] REQ-PROC-004: a `VALIDATION_FAILED` `IntakeFile` never gets a `statement_job` row.
-- [x] REQ-PROC-003: assert the job stores a path string, and that the row has no column holding
-      file bytes.
-- [x] API: `POST /batches` with one good PDF, then `run_worker_once`, then
-      `GET /batches/{id}` shows the job `COMPLETED` and batch `COMPLETED`.
-- [x] Name tests with REQ IDs where it's natural (`test_req_proc_101_*`).
-- [x] Keep total coverage ≥ 90%.
+### 7. Financial validation — `app/services/financial_validation.py`
+- [ ] `validate_statement(session, statement) -> str` returning `VALID` / `WARNING` / `FAILED`,
+      running the three levels in decision 5. Pure read + arithmetic in integer cents; ratios
+      never involved here.
+- [ ] Reconciliation compares `opening_balance_cents + Σcredit − Σdebit` to
+      `closing_balance_cents` exactly.
 
-### 8. Checks
-- [x] `uv run pytest` (coverage gate), `uv run ruff check .`, `uv run ruff format --check .`
-- [x] Manual end-to-end once: start the backend, `POST /batches` a real native-text PDF, poll
-      `GET /batches/{id}` until `COMPLETED`.
+### 8. Wire into the worker
+- [ ] `app/workers/queue.py`: `mark_unsupported(session, job, reason)` (terminal, no attempt
+      bump — it's not a failed attempt); `mark_completed` gains `statement_id`.
+- [ ] `app/models/jobs.py` + migration: `StatementJob.statement_id: str | None` FK.
+- [ ] `app/workers/processor.py`: the new flow above, with the error table's classification.
+- [ ] `app/workers/coordinator.py`: a batch whose completed jobs produced a `Statement` with
+      `validation_result` in `{WARNING, FAILED}` → `COMPLETED_WITH_WARNINGS` (REQ-VAL-003 /
+      REQ-RPT-002), even when every job is `COMPLETED`.
 
-### 9. Docs
-- [x] `docs/activity.md` entry (append).
-- [x] `README.md` "Status" + "Next up" sections.
+### 9. API surface
+- [ ] `GET /batches/{batch_id}`: add a `statements` array — `{id, bank, account_type,
+      account_identifier_masked, validation_result, extraction_status}` — so History/Review
+      (#9) have the per-statement trust signal. `POST /batches` response unchanged.
+
+### 10. Tests (coverage stays ≥ 90%; NFR-MAINT-001/002)
+- [ ] `test_detection.py`: synthetic Santander page → `confidence ≥ 0.70` with the right key;
+      a non-Santander page → below threshold; empty/garbage text → below threshold.
+- [ ] `test_santander_checking_v1.py`: golden parse of the committed synthetic PDF → exact
+      expected transaction count, dates, amounts (cents), directions, opening/closing balances.
+- [ ] `test_santander_local_golden.py`: parametrized over
+      `tests/fixtures/statements/local/*.pdf`, `skipif` none present — your real golden test.
+- [ ] `test_normalization.py`: parsed → rows; **account reuse** (two statements, same masked
+      account → one `Account`); **account separation** (same bank, different masked digits →
+      two `Account` rows, REQ-ACC-002); full account number never stored; `SubCentPrecisionError`
+      surfaces.
+- [ ] `test_financial_validation.py` (NFR-MAINT-002): balanced statement → `VALID`;
+      one debit removed → reconciliation `FAILED`; a transaction dated outside the period →
+      `WARNING`; a missing closing balance → structural `FAILED`.
+- [ ] extend `test_job_queue.py`: clean PDF → job `COMPLETED`, `statement_id` set, one
+      `Statement` + N `Transaction` rows, `validation_result == "VALID"`; low-confidence detection
+      → job `UNSUPPORTED`, **zero `Statement` rows** (REQ-VAL-005); `ParserError` → job `FAILED`,
+      zero `Statement` rows; unbalanced statement → job `COMPLETED` but batch
+      `COMPLETED_WITH_WARNINGS`.
+- [ ] extend `test_batches_api.py`: `GET /batches/{id}` shows the produced statement and its
+      `validation_result`.
+- [ ] Name tests with REQ IDs where natural (`test_req_det_002_*`, `test_req_val_001_*`, …).
+
+### 11. Checks
+- [ ] `uv run pytest` (coverage gate), `uv run ruff check .`, `uv run ruff format --check .`.
+- [ ] Full manual pass of `docs/manual-verification-santander.md` (happy path, UNSUPPORTED,
+      reconciliation FAILED, multi-file isolation, account resolution, privacy/traceability).
+
+### 12. Docs
+- [ ] `docs/activity.md` entry (append).
+- [ ] `README.md` "Status" / "Next up".
+- [ ] Update `requirements.md` §20 open item (first institution chosen) and §5/§8 if the
+      detection threshold or tolerance should be recorded as spec — with your sign-off, since
+      `requirements.md` edits need approval.
 
 ## Review
 
-### What was completed
-
-All 9 task groups. `statement_job` model + migration `06a9bc8c453d`; a pure-DB queue
-repository (`workers/queue.py`); the processor with retry classification
-(`workers/processor.py`, `RetryableJobError` hook for #6); the idempotent batch coordinator
-(`workers/coordinator.py`); the worker runner + `BackgroundWorker` thread wired into a FastAPI
-`lifespan` (`workers/pool.py`, `main.py`); intake → queue wiring and `GET /batches/{batch_id}`
-(`api/batches.py`); SQLite WAL/busy_timeout pragmas (`db.py`); the shared `tests/_pdf.py` PDF
-helper.
-
-### Important changes / deviations
-
-- **Single polling thread, not `ProcessPoolExecutor`** (techstack.md §6) — decision #1, confirmed.
-  Contained to `workers/pool.py`; revisit if OCR throughput becomes a measured bottleneck.
-- **`mark_failed` now increments `attempt_count`** — the plan's non-retryable test expects
-  `attempt_count == 1`, and `mark_failed` wasn't counting the attempt. Now every failure path
-  counts the run. A first-try success still leaves `attempt_count == 0` (`mark_completed` doesn't
-  count); left as-is rather than doing an "increment at claim" refactor the plan didn't ask for.
-- Extracted text is **not persisted** at this step (decision #2) — build-plan #6 re-runs
-  extraction.
-
-### Tests performed
-
-`uv run pytest` — 57 passed, 96% coverage (gate 90%). `ruff check` / `ruff format --check` clean.
-New: happy path, empty queue, claim-exactly-one + not-reclaimable (two-worker race), REQ-PROC-101
-(retry ×2 then FAIL), REQ-PROC-102 (non-retryable fails immediately), coordinator (4 cases incl.
-intake-rejection-alone → warnings), REQ-PROC-003 (path not bytes), REQ-PROC-004 (rejected file
-gets no job), `BackgroundWorker` thread lifecycle, `POST /batches` → worker → `GET /batches/{id}`
-end-to-end, 404. Manual e2e against a real uvicorn server with the lifespan worker running:
-PDF + `.txt` → job `COMPLETED` (NATIVE) → batch `COMPLETED_WITH_WARNINGS`.
-
-### Known issues
-
-- Two OCR tests in `test_extraction.py` fail locally unless `C:\Program Files\Tesseract-OCR` is
-  on the shell PATH (a build-plan #4 environment quirk, not a regression). CI installs tesseract.
-- `workers/pool.py` lines 54 / 66–71 / 73 uncovered — the `start()` re-entry guard and the
-  loop's defensive `except`. Edge paths; total coverage still 96%.
-- Branch is stacked on `feature/extraction-pipeline` (PR #7), not `main`.
-
-### Recommended next step
-
-Merge PR #7, then this branch's PR, then build-plan #6 — bank detection and parsing (the first
-consumer of `RetryableJobError` and the point `UNSUPPORTED` becomes reachable).
+_(filled in when the work is done)_
