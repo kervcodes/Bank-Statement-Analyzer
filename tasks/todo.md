@@ -143,54 +143,90 @@ strings. The frontend (#9) formats for display; #8 will build the LLM its own sa
 
 ### Part B — Analytics engine
 
+**Branch:** `feature/analytics-engine` off updated `main` (PR #11 merged). No new migration —
+Part B is read-only over the schema Part A shipped.
+
+#### Decisions to confirm before I write Part B code
+
+**B-a. No `pandas`** (restating decision 3 now that it's live): plain Python + `Decimal` +
+stdlib. Say if you want the spec's `pandas` instead.
+
+**B-b. Period = calendar month, keyed `"YYYY-MM"`.** `cash_flow` buckets by calendar month;
+`trends` compares the latest month that has data against the one before it, within the filtered
+ledger. No partial-month proration. Weekly/other periods are a later concern (`period=` arg
+exists but only `"month"` is implemented).
+
+**B-c. Recurring detection (REQ-ANLY-002).** Group debits by `description_normalized`
+(casefolded). A group qualifies as recurring when: ≥ 3 occurrences; the median gap between
+consecutive dates falls within tolerance of a known cadence — weekly (7d), biweekly (14d),
+monthly (28–31d), annual (~365d), tolerance ±25% of the cadence; and every amount is within
+±15% of the group's median amount. Output per match: `{merchant, cadence,
+typical_amount_cents (median), occurrences, first_seen, last_seen}`. Groups that fail any test
+are simply not reported (no "irregular" bucket).
+
+**B-d. Response shape.** One `Analytics` Pydantic model, nested sub-models. Every money field
+is integer `*_cents`. Every ratio/delta is `Decimal`-computed and serialized as a string
+(e.g. `"-0.1250"`, 4 dp) alongside its absolute `*_cents` counterpart. `GET /analytics` takes
+optional `start` / `end` as ISO `date` (inclusive); FastAPI rejects a malformed date as 422.
+
+**B-e. Coverage summary (REQ-RPT-001).** Reports statements *included* vs *excluded* (each
+excluded one with a reason: `FAILED` / `DUPLICATE`), the actual transaction-date span of the
+ledger, and the live transaction count. "Expected vs processed" (the user saying "I expect 12
+months") is a Dashboard/#9 concern — not invented here.
+
 #### B1. Ledger query — `app/services/ledger.py`
-- [ ] `ledger_transactions(session, *, start=None, end=None) -> list[Transaction]` — the
+- [x] `ledger_transactions(session, *, start=None, end=None) -> list[Transaction]` — the
       unified deduplicated ledger (decision 8), optional date filter on `transaction_date`.
-- [ ] `coverage_summary(session, *, start=None, end=None) -> Coverage` — statements included vs
+- [x] `coverage_summary(session, *, start=None, end=None) -> Coverage` — statements included vs
       excluded (with reason: `FAILED` / `DUPLICATE`), date range actually covered, counts
       (REQ-RPT-001).
 
 #### B2. Analytics — `app/services/analytics.py`
-- [ ] `cash_flow(txns, *, period="month")` — per-period credits / debits / net, in cents.
-- [ ] `spending_by_category(txns)` — debit totals grouped by `category` (`None` →
+- [x] `cash_flow(txns, *, period="month")` — per-period credits / debits / net, in cents.
+- [x] `spending_by_category(txns)` — debit totals grouped by `category` (`None` →
       `"Uncategorized"`).
-- [ ] `merchant_totals(txns, *, limit=10)` — top debit merchants by total, grouped on
+- [x] `merchant_totals(txns, *, limit=10)` — top debit merchants by total, grouped on
       `description_normalized`.
-- [ ] `recurring_charges(txns)` — group debits by `description_normalized`; for groups of ≥ 3,
+- [x] `recurring_charges(txns)` — group debits by `description_normalized`; for groups of ≥ 3,
       detect a regular cadence (weekly / biweekly / monthly / annual, within a tolerance) and a
       similar amount (within a small % band, REQ-ANLY-002); return
-      `{merchant, cadence, typical_amount_cents, occurrences, last_seen}`.
-- [ ] `trends(txns)` — current period vs previous: spending and net cash-flow deltas, as
+      `{merchant, cadence, typical_amount_cents, occurrences, first_seen, last_seen}`.
+- [x] `trends(txns)` — current period vs previous: spending and net cash-flow deltas, as
       `Decimal` ratios rendered to strings.
-- [ ] `build_analytics(session, *, start, end) -> Analytics` — assembles all of the above plus
+- [x] `build_analytics(session, *, start, end) -> Analytics` — assembles all of the above plus
       `coverage`. Pure functions; `Decimal` for every ratio, integer cents for every amount;
       never calls anything in `app/parsers` or an LLM.
 
 #### B3. Endpoint
-- [ ] `GET /analytics?start=&end=` → the `Analytics` Pydantic model. `main.py` wires the router.
-- [ ] Works with an empty ledger (returns zeros / empty lists, `coverage` reflecting nothing
+- [x] `GET /analytics?start=&end=` → the `Analytics` Pydantic model. `main.py` wires the router.
+- [x] Works with an empty ledger (returns zeros / empty lists, `coverage` reflecting nothing
       processed) — no 500.
 
 #### B4. Tests — `tests/test_analytics.py`, `tests/test_ledger.py`
-- [ ] Ledger excludes `DUPLICATE` transactions, `DUPLICATE` statements, and `FAILED`
+- [x] Ledger excludes `DUPLICATE` transactions, `DUPLICATE` statements, and `FAILED`
       statements; includes `WARNING` and `POSSIBLE_DUPLICATE`.
-- [ ] Cash flow / merchant totals / spending-by-category on a hand-built set of transactions →
+- [x] Cash flow / merchant totals / spending-by-category on a hand-built set of transactions →
       exact expected cents.
-- [ ] Recurring: 4 monthly charges to "NETFLIX" at `15.99, 15.99, 16.49, 16.49` → detected as
+- [x] Recurring: monthly charges to "NETFLIX" at `15.99, 15.99, 16.49, 16.49` → detected as
       monthly recurring with a typical amount (build-plan #7 explicitly asks for the
       slightly-varying-amount case).
-- [ ] Recurring: 3 charges to one merchant at random intervals → **not** flagged recurring.
-- [ ] Trends: two periods with known totals → correct delta strings.
-- [ ] `coverage_summary` lists an excluded `FAILED` statement with its reason.
-- [ ] `GET /analytics` end to end via `TestClient` on a small seeded ledger; empty-ledger case.
+- [x] Recurring: 3 charges to one merchant at random intervals → **not** flagged recurring
+      (plus: unstable amount, and a repeated date → also not flagged).
+- [x] Trends: two periods with known totals → correct delta strings.
+- [x] `coverage_summary` lists an excluded `FAILED` statement with its reason.
+- [x] `GET /analytics` end to end via `TestClient` on a small seeded ledger; empty-ledger case;
+      bad-date → 422.
 
 ### C. Checks & docs
-- [ ] `uv run pytest` (coverage gate ≥ 90), `uv run ruff check .`, `uv run ruff format --check .`.
-- [ ] Manual: process two batches where batch 2 re-uploads a statement from batch 1 →
-      `GET /analytics` totals are identical to batch 1 alone (the re-upload didn't double
-      anything); `GET /review/duplicates` shows nothing for an exact re-upload.
-- [ ] `docs/activity.md` entry (append); `README.md` Status / Next up.
-- [ ] `tasks/todo.md` Review section.
+- [x] `uv run pytest` (coverage gate ≥ 90 — **128 passed, 96%**), `uv run ruff check .`,
+      `uv run ruff format --check .` all clean.
+- [x] Two batches where batch 2 re-uploads a statement from batch 1 → `GET /analytics` totals
+      identical to batch 1 alone; `GET /review/duplicates` empty for an exact re-upload —
+      covered by `test_reuploaded_statement_does_not_double_analytics`. Live-server run still
+      pending (dev DB locked by DB Browser, same as Part A).
+- [x] `docs/activity.md` entry (append); `README.md` Status / Next up (→ #8).
+- [x] `docs/manual-verification-analytics.md` — step-by-step manual verification runbook.
+- [x] `tasks/todo.md` Review section (below).
 
 ## Review
 
@@ -224,6 +260,45 @@ worker-path case.
 - The `min(created_at, id)` canonical-picker only matters when several existing statements
   match at once (rare); for a plain re-upload the one prior statement is unambiguous.
 
-### Part B — Analytics engine (follow-up PR, branch `feature/analytics-engine` off updated main)
+### Part B — Analytics engine (this PR, branch `feature/analytics-engine` off updated main)
 
-_(filled in when Part B is done)_
+**Completed:** `app/services/ledger.py` (`ledger_transactions` + `coverage_summary`),
+`app/services/analytics.py` (six pure functions + `build_analytics`), `app/api/analytics.py`
+(`GET /analytics?start=&end=`), wired in `main.py`. `tests/test_ledger.py` (7) and
+`tests/test_analytics.py` (21). No migration — Part B is read-only over Part A's schema.
+
+**Key design points:**
+- **The ledger is defined once**, in `ledger.py`: row not `DUPLICATE`, statement not
+  `DUPLICATE`, statement validated `VALID`/`WARNING`. Everything in `analytics.py` takes the
+  resulting `list[Transaction]` — it never re-queries.
+- **No `pandas`** (decision B-a, confirmed) — `defaultdict` accumulation + `statistics` +
+  `Decimal`.
+- **Periods are calendar months** (`"YYYY-MM"`); `trends` = latest month with data vs the one
+  before. `cash_flow`'s `period=` arg raises on anything but `"month"`.
+- **Recurring:** ≥ 3 same-description debits, median inter-charge gap within ±25% of a known
+  cadence (7 / 14 / 30 / 365 d), all amounts within ±15% of the median amount. Non-qualifying
+  groups are omitted entirely.
+- **Money stays integer cents; ratios are 4-dp strings** (`"0.2500"`), `None` when the base
+  is zero.
+
+**Deviations from the plan:** none of substance.
+- `_amounts_are_stable` needed no zero-median special case — a zero median gives a zero
+  tolerance band, which already admits only exact-zero amounts.
+- Added `first_seen` to `RecurringCharge` alongside the planned `last_seen` (both are cheap and
+  the dashboard will want the span).
+- The planned "manual: two batches, re-upload doesn't double" check is implemented as a test
+  (`test_reuploaded_statement_does_not_double_analytics`) rather than left as a live-only step.
+
+**Tests:** `uv run pytest` — **128 passed, 96% coverage** (gate 90). `ruff check` /
+`ruff format --check` clean. `ledger.py` and `analytics.py` at ~100% line coverage.
+
+**Known / follow-ups:**
+- Live-server manual E2E not run — dev `data/app.db` still locked by DB Browser (same
+  constraint as Part A). `docs/manual-verification-analytics.md` is the runbook for when it's
+  free; the automated DB + `TestClient` tests cover the same paths.
+- `spending_by_category` and `merchant_totals` group on `description_normalized` /
+  `category` as they stand today (~all `Uncategorized`, lightly-cleaned descriptions). Real
+  categorization and merchant normalization are build-plan #8 and will improve these with no
+  API change.
+- Only monthly cash-flow buckets are implemented; weekly/quarterly is a later concern if a
+  screen needs it.

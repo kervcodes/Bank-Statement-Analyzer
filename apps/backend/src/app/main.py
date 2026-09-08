@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.analytics import router as analytics_router
 from app.api.batches import router as batches_router
 from app.api.review import router as review_router
 from app.workers.pool import BackgroundWorker
@@ -26,6 +27,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(lifespan=lifespan)
 app.include_router(batches_router)
 app.include_router(review_router)
+app.include_router(analytics_router)
 
 # Single-user local desktop app: the renderer (Vite dev server or a packaged
 # file:// origin) is always cross-origin from this sidecar on 127.0.0.1, and
