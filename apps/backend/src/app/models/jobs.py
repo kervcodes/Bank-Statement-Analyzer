@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from sqlmodel import CheckConstraint, Field, Relationship, SQLModel
 
-from app.models.canonical import Batch
+from app.models.canonical import Batch, Statement
 from app.models.intake import IntakeFile
 
 JOB_STATUSES = (
@@ -71,8 +71,15 @@ class StatementJob(SQLModel, table=True):
     # Filled on success, for observability only (NATIVE / OCR).
     extraction_method: str | None = None
     page_count: int | None = None
+    # The Statement this job produced (build-plan #6). Null while QUEUED/PROCESSING,
+    # and stays null for FAILED / UNSUPPORTED jobs -- REQ-VAL-005: a job that did
+    # not parse successfully produces no Statement row.
+    statement_id: str | None = Field(
+        default=None, foreign_key="statement.id", index=True
+    )
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 
     batch: Batch = Relationship()
     intake_file: IntakeFile = Relationship()
+    statement: Statement | None = Relationship()

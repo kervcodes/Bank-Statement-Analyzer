@@ -49,7 +49,7 @@ Each prompt assumes `techstack.md`, `design-notes.md`, `requirements.md`, and `b
 
 ## 6. First bank parser, end to end
 
-- Build the first parser fully: [name your highest-priority institution, e.g. Chase checking].
+- Build the first parser fully: [name your highest-priority institution, e.g. Santander checking].
 - The versioned parser module.
 - Bank/format detection with a confidence score.
 - Normalization into the canonical schema.

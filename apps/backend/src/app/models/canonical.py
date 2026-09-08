@@ -2,7 +2,13 @@ from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from sqlmodel import CheckConstraint, Field, Relationship, SQLModel
+from sqlmodel import (
+    CheckConstraint,
+    Field,
+    Relationship,
+    SQLModel,
+    UniqueConstraint,
+)
 
 if TYPE_CHECKING:
     from app.models.intake import IntakeFile
@@ -50,7 +56,22 @@ class Batch(SQLModel, table=True):
 
 
 class Account(SQLModel, table=True):
-    """A resolved internal account identity. Never stores the full account number."""
+    """A resolved internal account identity. Never stores the full account number.
+
+    Identity is (bank, account_type, masked digits) -- normalization resolves an
+    incoming statement to an existing row on that tuple or creates one. The
+    unique constraint makes "one account per identity" a database invariant, not
+    just application convention (REQ-ACC-002).
+    """
+
+    __table_args__ = (
+        UniqueConstraint(
+            "bank",
+            "account_type",
+            "account_identifier_masked",
+            name="uq_account_identity",
+        ),
+    )
 
     id: str = Field(default_factory=_uuid, primary_key=True)
     bank: str

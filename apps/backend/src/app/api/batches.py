@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from sqlmodel import Session, col, select
 
 from app.db import DATA_DIR, get_db_session
-from app.models import Batch, IntakeFile, StatementJob
+from app.models import Batch, IntakeFile, Statement, StatementJob
 from app.services.intake_validation import validate_pdf
 from app.workers.queue import enqueue_job
 
@@ -43,6 +43,15 @@ class JobStatus(BaseModel):
     extraction_method: str | None = None
 
 
+class StatementSummary(BaseModel):
+    id: str
+    bank: str
+    account_type: str
+    account_identifier_masked: str
+    extraction_status: str
+    validation_result: str | None = None
+
+
 class BatchStatusResponse(BaseModel):
     batch_id: str
     status: str
@@ -53,6 +62,7 @@ class BatchStatusResponse(BaseModel):
     processed: int
     processing_failed: int
     jobs: list[JobStatus]
+    statements: list[StatementSummary]
 
 
 @router.post("", response_model=BatchIntakeResponse)
@@ -180,6 +190,12 @@ def get_batch(
         .order_by(col(StatementJob.created_at))
     ).all()
 
+    statements = session.exec(
+        select(Statement)
+        .where(col(Statement.batch_id) == batch_id)
+        .order_by(col(Statement.statement_start_date))
+    ).all()
+
     return BatchStatusResponse(
         batch_id=batch.id,
         status=batch.status,
@@ -198,5 +214,16 @@ def get_batch(
                 extraction_method=j.extraction_method,
             )
             for j in jobs
+        ],
+        statements=[
+            StatementSummary(
+                id=s.id,
+                bank=s.bank,
+                account_type=s.account_type,
+                account_identifier_masked=s.account_identifier_masked,
+                extraction_status=s.extraction_status,
+                validation_result=s.validation_result,
+            )
+            for s in statements
         ],
     )

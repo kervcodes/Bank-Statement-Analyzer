@@ -59,3 +59,68 @@ def build_pdf(
 
 
 NATIVE_TEXT_PAGE = "REQ EXT NATIVE PATH SAMPLE STATEMENT TEXT FORTY CHARS MIN"
+
+
+Token = tuple[float, float, str]  # (x, y-from-bottom, text)
+
+
+def _escape(text: str) -> str:
+    return text.replace("\\", r"\\").replace("(", r"\(").replace(")", r"\)")
+
+
+def build_positioned_pdf(
+    pages: list[list[Token]],
+    page_size: tuple[int, int] = (612, 792),
+    font_size: int = 8,
+) -> bytes:
+    """A PDF that draws each token at an absolute (x, y) position.
+
+    Lets a fixture reproduce a real statement's column layout, so
+    ``page.extract_words()`` returns tokens with the x-coordinates a positional
+    parser depends on. Same hand-built-object approach as ``build_pdf`` (no PDF
+    library dependency).
+    """
+    n_pages = len(pages)
+    font_obj_num = 3
+    page_obj_nums = [4 + 2 * i for i in range(n_pages)]
+    content_obj_nums = [n + 1 for n in page_obj_nums]
+
+    kids = " ".join(f"{n} 0 R" for n in page_obj_nums)
+    objects: dict[int, bytes] = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: f"<< /Type /Pages /Kids [{kids}] /Count {n_pages} >>".encode(),
+        font_obj_num: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    }
+    for i, tokens in enumerate(pages):
+        parts = [
+            f"BT /F1 {font_size} Tf {x:.2f} {y:.2f} Td ({_escape(text)}) Tj ET"
+            for x, y, text in tokens
+        ]
+        content = "\n".join(parts).encode()
+        objects[page_obj_nums[i]] = (
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_size[0]} {page_size[1]}] "
+            f"/Resources << /Font << /F1 {font_obj_num} 0 R >> >> "
+            f"/Contents {content_obj_nums[i]} 0 R >>"
+        ).encode()
+        objects[content_obj_nums[i]] = (
+            f"<< /Length {len(content)} >>\nstream\n".encode()
+            + content
+            + b"\nendstream"
+        )
+
+    max_obj = max(objects)
+    buf = bytearray(b"%PDF-1.4\n")
+    offsets: dict[int, int] = {}
+    for i in range(1, max_obj + 1):
+        offsets[i] = len(buf)
+        buf += f"{i} 0 obj\n".encode() + objects[i] + b"\nendobj\n"
+
+    xref_offset = len(buf)
+    buf += f"xref\n0 {max_obj + 1}\n".encode()
+    buf += b"0000000000 65535 f \n"
+    for i in range(1, max_obj + 1):
+        buf += f"{offsets[i]:010d} 00000 n \n".encode()
+    buf += b"trailer\n"
+    buf += f"<< /Size {max_obj + 1} /Root 1 0 R >>\n".encode()
+    buf += f"startxref\n{xref_offset}\n%%EOF".encode()
+    return bytes(buf)
