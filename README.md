@@ -20,16 +20,22 @@ service pulls page text out of an accepted PDF — native text via `pdfplumber` 
 one contract either way.
 
 Every accepted file gets a `statement_job` row, and a background worker (a single polling thread,
-started with the app) claims each job, runs it through the extraction pipeline, and retries
-transient failures up to twice before marking it failed. Once every job in a batch reaches a
-terminal state, a coordinator flips the batch to `COMPLETED` (or `COMPLETED_WITH_WARNINGS` if any
-file was excluded at intake or processing). `GET /batches/{id}` reports batch counters and
-per-job status. A "completed" job here means *the PDF's text was extracted* — no bank detection,
-parsers, `Statement` rows, or analytics yet.
+started with the app) claims each job and runs it end to end: extract text → detect the issuing
+bank, account type, and layout version from the content (never the filename) with a confidence
+score → below threshold, mark the job `UNSUPPORTED` and produce no `Statement` → otherwise parse
+with a versioned, bank-specific parser, normalize into the canonical schema (resolving a stable
+masked `Account` identity), and run three-level financial validation (structural,
+transaction-level, and `opening + credits − debits == closing` reconciliation to the cent). The
+first parser, `santander_checking_v1`, is built and regression-tested against real statements.
+Transient failures retry twice; a parse error or a sub-cent misread fails the job without a
+`Statement`. Once every job in a batch is terminal, a coordinator flips the batch to `COMPLETED`
+— or `COMPLETED_WITH_WARNINGS` if any file was excluded at intake, failed processing, or
+produced a statement that doesn't reconcile. `GET /batches/{id}` reports batch counters, per-job
+status, and the produced statements with their validation result.
 
-Next up is bank detection and parsing (`build-plan.md` #6). Progress is logged in
-[`docs/activity.md`](./docs/activity.md), and written up for humans as a build log at
-[kervintznoel.com/posts](https://kervintznoel.com/posts/build-log-1-a-window-that-says-ok).
+Next up is deduplication and the deterministic analytics engine (`build-plan.md` #7). Progress
+is logged in [`docs/activity.md`](./docs/activity.md), and written up for humans as a build log
+at [kervintznoel.com/posts](https://kervintznoel.com/posts/build-log-1-a-window-that-says-ok).
 
 ## What it does (v1)
 
@@ -99,7 +105,7 @@ pnpm dev
 ```
 
 To continue building, run the prompts in [`build-plan.md`](./build-plan.md) in order, starting
-from #3 — they're sequenced so each one builds on a working, tested version of the last.
+from #7 — they're sequenced so each one builds on a working, tested version of the last.
 
 ## Testing
 

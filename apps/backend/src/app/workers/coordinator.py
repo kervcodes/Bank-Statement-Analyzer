@@ -8,7 +8,7 @@ counts each time.
 
 from sqlmodel import Session, col, func, select
 
-from app.models import TERMINAL_JOB_STATUSES, Batch, StatementJob
+from app.models import TERMINAL_JOB_STATUSES, Batch, Statement, StatementJob
 
 
 def refresh_batch(session: Session, batch_id: str) -> None:
@@ -32,9 +32,22 @@ def refresh_batch(session: Session, batch_id: str) -> None:
     batch.processed = counts.get("COMPLETED", 0)
     batch.processing_failed = failed
 
-    # REQ-RPT-002: any exclusion at all -- a failed job, or a file rejected at
-    # intake -- means the analysis is not complete and must say so.
-    excluded = failed + batch.validation_failed + batch.upload_failed
+    # A job can COMPLETE (the PDF parsed) while the statement it produced fails or
+    # warns on financial validation -- REQ-VAL-003 excludes those from trusted
+    # analytics, so the batch is not a clean "COMPLETED" either.
+    flagged_statements = session.exec(
+        select(func.count())
+        .select_from(Statement)
+        .where(col(Statement.batch_id) == batch_id)
+        .where(col(Statement.validation_result).in_(("WARNING", "FAILED")))
+    ).one()
+
+    # REQ-RPT-002: any exclusion at all -- a failed job, a file rejected at
+    # intake, or a statement that doesn't reconcile -- means the analysis is not
+    # complete and must say so.
+    excluded = (
+        failed + batch.validation_failed + batch.upload_failed + flagged_statements
+    )
     batch.status = "COMPLETED" if excluded == 0 else "COMPLETED_WITH_WARNINGS"
     session.add(batch)
     session.commit()

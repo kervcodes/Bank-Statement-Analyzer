@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from _pdf import NATIVE_TEXT_PAGE, build_pdf
+from _santander_sample import build_santander_sample
 from sqlalchemy import Engine
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
@@ -84,21 +85,30 @@ def statement(session: Session, batch: Batch) -> Statement:
 
 @pytest.fixture()
 def native_pdf_path(tmp_path: Path) -> Path:
-    """A real on-disk PDF with usable embedded text -- extraction takes the
-    NATIVE path against it, no OCR binary involved."""
+    """A minimal on-disk PDF with usable embedded text but no recognizable bank
+    layout -- extraction takes the NATIVE path, and bank detection scores it
+    below threshold (the UNSUPPORTED case)."""
     path = tmp_path / "statement.pdf"
     path.write_bytes(build_pdf([NATIVE_TEXT_PAGE]))
     return path
 
 
 @pytest.fixture()
-def intake_file(session: Session, batch: Batch, native_pdf_path: Path) -> IntakeFile:
+def santander_pdf_path(tmp_path: Path) -> Path:
+    """A synthetic Santander checking statement that parses end to end."""
+    path = tmp_path / "santander.pdf"
+    path.write_bytes(build_santander_sample())
+    return path
+
+
+@pytest.fixture()
+def intake_file(session: Session, batch: Batch, santander_pdf_path: Path) -> IntakeFile:
     row = IntakeFile(
         batch_id=batch.id,
-        original_filename="statement.pdf",
+        original_filename="santander.pdf",
         status="ACCEPTED",
-        temp_path=str(native_pdf_path),
-        page_count=1,
+        temp_path=str(santander_pdf_path),
+        page_count=2,
     )
     session.add(row)
     session.commit()
