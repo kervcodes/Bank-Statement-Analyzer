@@ -681,3 +681,78 @@ batches through the real worker → second `Statement` `DUPLICATE`, ledger uncha
 coverage summary, recurring-charge detection. Manual live-server E2E for dedup is pending — the
 dev `data/app.db` is still locked by an open DB Browser; the automated two-batch worker test
 covers the same path.
+
+---
+
+## 2026-09-08 — Analytics engine (build-plan #7, Part B of 2)
+
+**Prompt:** "continue with Part B - Analytics Engine" → approved the plan + four decisions
+(no pandas; calendar-month periods; the recurring-detection rule; response shape). Branch
+`feature/analytics-engine` off updated `main` (PR #11 merged first). Traces to
+`requirements.md` §10 (REQ-ANLY-001..004) and §13.1 (REQ-RPT-001).
+
+**No migration.** Part B is read-only over the schema Part A shipped.
+
+**`app/services/ledger.py`** — the single definition of "the ledger" every analytics function
+reads:
+- `ledger_transactions(session, *, start=None, end=None)` — transactions where the row is not
+  `DUPLICATE`, its statement is not `DUPLICATE`, and the statement validated `VALID`/`WARNING`
+  (a `FAILED` or un-validated statement is out, REQ-VAL-003). `POSSIBLE_DUPLICATE` rows and
+  `WARNING` statements stay in. Optional inclusive `transaction_date` window. Ordered oldest
+  first. Implemented as a subquery of statement ids + an `IN` on the transaction query so it's
+  one round trip.
+- `coverage_summary(...)` — `Coverage` dataclass: statements included (distinct in the ledger)
+  vs excluded (each `FAILED` or `DUPLICATE` statement with its reason and period), the ledger's
+  real first/last transaction date, live transaction count. When a window is given, excluded
+  statements are limited to those whose period overlaps it.
+
+**`app/services/analytics.py`** — pure functions, no DB except `build_analytics`, no
+`app/parsers`, no LLM, no bank branching (REQ-NORM-005). Money stays integer `*_cents`; every
+ratio is `Decimal`-computed and serialized as a fixed 4-dp string (`"0.2500"`), `None` when the
+base is zero:
+- `cash_flow(txns, *, period="month")` — per calendar-month credits / debits / net. Only
+  `"month"` is implemented; any other value raises rather than silently returning the wrong
+  bucketing.
+- `spending_by_category(txns)` — debit totals by `category` (`None` → `"Uncategorized"`),
+  largest first. (Categorization is #8; today this is ~one bucket.)
+- `merchant_totals(txns, *, limit=10)` — top debit merchants by spend, grouped on
+  `description_normalized` as it stands (real merchant normalization is #8).
+- `recurring_charges(txns)` — group debits by casefolded normalized description; a group of ≥ 3
+  qualifies when the **median gap** between consecutive dates is within ±25% of a known cadence
+  (weekly 7d / biweekly 14d / monthly 30d / annual 365d) **and** every amount is within ±15% of
+  the group's median amount (REQ-ANLY-002: price drift still counts). Returns `{merchant,
+  cadence, typical_amount_cents (median), occurrences, first_seen, last_seen}`. Non-qualifying
+  groups are simply omitted — there is no "irregular" bucket.
+- `trends(txns)` — the latest month with data vs the one before: spending and net-cash-flow
+  deltas, each as absolute `*_cents` and a ratio string. Fewer than two months → zero deltas.
+- `build_analytics(session, *, start, end) -> Analytics` — assembles all of the above plus the
+  coverage summary into one Pydantic model.
+
+**API:** `GET /analytics?start=&end=` (`app/api/analytics.py`, wired in `main.py`) → the
+`Analytics` model. `start`/`end` are optional ISO dates; FastAPI rejects a malformed one as
+422. Computed on demand each call (no materialized cache — decision 2). Empty ledger returns
+zeros / empty lists, never a 500.
+
+**Tests:** `uv run pytest` — **128 passed, 96% coverage** (gate 90). `ruff check` /
+`ruff format --check` clean. New:
+- `test_ledger.py` (7) — inclusion/exclusion rules, inclusive date window, coverage counts +
+  excluded-statement reasons, window-limited exclusions, empty ledger.
+- `test_analytics.py` (21) — exact-cents cash flow / category / merchant aggregation on a
+  hand-built ledger; the `15.99/15.99/16.49/16.49` NETFLIX case detected as monthly recurring;
+  irregular-interval and unstable-amount groups rejected; a repeated-date group rejected;
+  trends delta strings; single-period and empty-ledger trends; `build_analytics` + the endpoint
+  over a seeded DB; empty-ledger endpoint is 200 not 500; bad date → 422; and the plan's manual
+  check as a test — the same statement processed in two batches, dedup collapses the re-upload,
+  `build_analytics` totals are byte-for-byte unchanged.
+
+**Deviations from the plan:** none of substance. `merchant_totals` / `recurring_charges` group
+on `description_normalized` (not a dedicated merchant field) exactly as the plan's "Not in
+scope" note says. `_amounts_are_stable` needed no zero-median special case — a zero median
+makes the tolerance band zero, which already admits only exact-zero amounts.
+
+**Manual live-server E2E:** still not run — the dev `data/app.db` remains locked by an open DB
+Browser (same as Part A). The two-batch "re-upload doesn't double analytics" test exercises the
+exact path the manual check in `docs/manual-verification-analytics.md` describes.
+
+**Next step:** build-plan.md #8 — categorization, the Privacy Gateway, and the LLM explanation
+layer.

@@ -37,9 +37,17 @@ When a batch finishes, its new statements are checked for duplicates — stateme
 same PDF uploaded twice, auto-collapsed) then transaction-level for partial overlaps (a "last
 90 days" statement overlapping monthly ones). Nothing is ever deleted: a duplicate row keeps
 its place and is excluded from the ledger, and anything ambiguous is flagged for Review
-(`GET /review/duplicates`) rather than collapsed. The deterministic analytics engine over that
-deduplicated ledger is next (`build-plan.md` #7, part 2). Progress is logged in
-[`docs/activity.md`](./docs/activity.md), and written up for humans as a build log at
+(`GET /review/duplicates`) rather than collapsed.
+
+`GET /analytics?start=&end=` computes the dashboard numbers deterministically over that
+deduplicated, validated ledger: monthly cash flow (credits / debits / net), spending by
+category, top merchants, recurring-charge detection (merchant + regular cadence + a stable but
+not necessarily identical amount, so a subscription with price drift is still caught),
+month-over-month trends, and a coverage summary (statements included vs. excluded and why, the
+ledger's real date span) shown alongside every total. No LLM, no bank-specific branching, money
+in integer cents, ratios as fixed-precision strings. Next: `build-plan.md` #8 —
+categorization, the Privacy Gateway, and the optional LLM explanation layer. Progress is logged
+in [`docs/activity.md`](./docs/activity.md), and written up for humans as a build log at
 [kervintznoel.com/posts](https://kervintznoel.com/posts/build-log-1-a-window-that-says-ok).
 
 ## What it does (v1)
@@ -110,7 +118,7 @@ pnpm dev
 ```
 
 To continue building, run the prompts in [`build-plan.md`](./build-plan.md) in order, starting
-from #7 — they're sequenced so each one builds on a working, tested version of the last.
+from #8 — they're sequenced so each one builds on a working, tested version of the last.
 
 ## Testing
 
