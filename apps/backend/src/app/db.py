@@ -26,6 +26,12 @@ def _enable_sqlite_foreign_keys(dbapi_connection, connection_record) -> None:
     if dbapi_connection.__class__.__module__.startswith("sqlite3"):
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
+        # The background worker (app/workers/) writes to the same database file
+        # as the request handlers. WAL lets a reader and a writer coexist
+        # without blocking; busy_timeout makes a briefly-locked write wait and
+        # retry instead of failing immediately with "database is locked".
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=5000")
         cursor.close()
 
 

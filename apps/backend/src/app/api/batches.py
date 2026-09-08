@@ -1,18 +1,18 @@
 """REQ-INT-001/005/006: accept one or more PDFs, validate each independently.
 
-Only builds the Batch and per-file intake records (REQ-INT-006: tracked from
-the moment files are selected). Nothing here queues a job -- that table and
-worker pool don't exist until build-plan #5, which will read ACCEPTED
-IntakeFile rows to build jobs from.
+Builds the Batch and per-file intake records (REQ-INT-006), then enqueues a
+processing job for every accepted file (REQ-PROC-002/004). The background worker
+(app/workers/) picks the jobs up; GET /batches/{id} reports progress.
 """
 
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
-from sqlmodel import Session
+from sqlmodel import Session, col, select
 
 from app.db import DATA_DIR, get_db_session
-from app.models import Batch, IntakeFile
+from app.models import Batch, IntakeFile, StatementJob
 from app.services.intake_validation import validate_pdf
+from app.workers.queue import enqueue_job
 
 router = APIRouter(prefix="/batches", tags=["batches"])
 
@@ -35,6 +35,26 @@ class BatchIntakeResponse(BaseModel):
     files: list[IntakeFileResult]
 
 
+class JobStatus(BaseModel):
+    id: str
+    status: str
+    attempt_count: int
+    failure_reason: str | None = None
+    extraction_method: str | None = None
+
+
+class BatchStatusResponse(BaseModel):
+    batch_id: str
+    status: str
+    selected: int
+    uploaded: int
+    upload_failed: int
+    validation_failed: int
+    processed: int
+    processing_failed: int
+    jobs: list[JobStatus]
+
+
 @router.post("", response_model=BatchIntakeResponse)
 async def create_batch(
     files: list[UploadFile] = File(...),  # noqa: B008 -- FastAPI's own idiom
@@ -55,6 +75,7 @@ async def create_batch(
 
     batch_temp_dir = TEMP_DIR / batch.id
     results: list[IntakeFileResult] = []
+    accepted_files: list[IntakeFile] = []
 
     for upload in files:
         filename = upload.filename or "unnamed file"
@@ -115,12 +136,23 @@ async def create_batch(
         temp_path.write_bytes(content)
         intake_file.temp_path = str(temp_path)
         session.add(intake_file)
+        accepted_files.append(intake_file)
         results.append(IntakeFileResult(filename=filename, status="ACCEPTED"))
 
     ready_count = batch.uploaded - batch.validation_failed
     batch.status = "PROCESSING" if ready_count > 0 else "FAILED"
     session.add(batch)
     session.commit()
+
+    # REQ-PROC-004: only accepted files get a job; rejected files never enter
+    # the queue.
+    for intake_file in accepted_files:
+        enqueue_job(
+            session,
+            batch_id=batch.id,
+            intake_file_id=intake_file.id,
+            pdf_path=intake_file.temp_path,
+        )
 
     return BatchIntakeResponse(
         batch_id=batch.id,
@@ -130,4 +162,41 @@ async def create_batch(
         upload_failed=batch.upload_failed,
         validation_failed=batch.validation_failed,
         files=results,
+    )
+
+
+@router.get("/{batch_id}", response_model=BatchStatusResponse)
+def get_batch(
+    batch_id: str,
+    session: Session = Depends(get_db_session),  # noqa: B008
+) -> BatchStatusResponse:
+    batch = session.get(Batch, batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="batch not found")
+
+    jobs = session.exec(
+        select(StatementJob)
+        .where(col(StatementJob.batch_id) == batch_id)
+        .order_by(col(StatementJob.created_at))
+    ).all()
+
+    return BatchStatusResponse(
+        batch_id=batch.id,
+        status=batch.status,
+        selected=batch.selected,
+        uploaded=batch.uploaded,
+        upload_failed=batch.upload_failed,
+        validation_failed=batch.validation_failed,
+        processed=batch.processed,
+        processing_failed=batch.processing_failed,
+        jobs=[
+            JobStatus(
+                id=j.id,
+                status=j.status,
+                attempt_count=j.attempt_count,
+                failure_reason=j.failure_reason,
+                extraction_method=j.extraction_method,
+            )
+            for j in jobs
+        ],
     )

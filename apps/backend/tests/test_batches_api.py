@@ -1,7 +1,9 @@
+from collections.abc import Callable
 from io import BytesIO
 from pathlib import Path
 
 import pytest
+from _pdf import NATIVE_TEXT_PAGE, build_pdf
 from fastapi.testclient import TestClient
 from pypdf import PdfWriter
 from sqlmodel import Session, select
@@ -9,7 +11,8 @@ from sqlmodel import Session, select
 import app.api.batches as batches_module
 from app.db import get_db_session
 from app.main import app
-from app.models import IntakeFile
+from app.models import IntakeFile, StatementJob
+from app.workers.pool import run_worker_once
 
 
 def _pdf_bytes(pages: int = 1, user_password: str | None = None) -> bytes:
@@ -88,3 +91,40 @@ def test_all_files_rejected_marks_batch_failed(client: TestClient):
     assert body["status"] == "FAILED"
     assert body["validation_failed"] == 1
     assert body["uploaded"] == 1
+
+
+def test_accepted_file_is_queued_and_processed_end_to_end(
+    client: TestClient,
+    session: Session,
+    session_factory: Callable[[], Session],
+):
+    files = [
+        (
+            "files",
+            ("chase_march.pdf", build_pdf([NATIVE_TEXT_PAGE]), "application/pdf"),
+        ),
+        ("files", ("notes.txt", b"hello", "text/plain")),
+    ]
+    post = client.post("/batches", files=files).json()
+    batch_id = post["batch_id"]
+    assert post["status"] == "PROCESSING"
+
+    # REQ-PROC-004: exactly one job, for the accepted file only.
+    jobs = session.exec(
+        select(StatementJob).where(StatementJob.batch_id == batch_id)
+    ).all()
+    assert len(jobs) == 1
+
+    assert run_worker_once(session_factory) is True
+    session.expire_all()
+
+    status = client.get(f"/batches/{batch_id}").json()
+    assert status["status"] == "COMPLETED_WITH_WARNINGS"  # the .txt was rejected
+    assert status["processed"] == 1
+    assert len(status["jobs"]) == 1
+    assert status["jobs"][0]["status"] == "COMPLETED"
+    assert status["jobs"][0]["extraction_method"] == "NATIVE"
+
+
+def test_get_batch_404_for_unknown_id(client: TestClient):
+    assert client.get("/batches/does-not-exist").status_code == 404

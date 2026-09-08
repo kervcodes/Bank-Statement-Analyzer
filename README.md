@@ -17,9 +17,17 @@ corrupted, password-protected, oversized, or too-many-page files with a specific
 tracks every file's status (`IntakeFile`) from the moment it's submitted. A standalone extraction
 service pulls page text out of an accepted PDF — native text via `pdfplumber` first, OCR via
 `pdf2image`/`pytesseract` as a fallback when a page has no usable embedded text — converging on
-one contract either way. No bank detection, parsers, job queue, or analytics yet.
+one contract either way.
 
-Next up is the background job queue (`build-plan.md` #5). Progress is logged in
+Every accepted file gets a `statement_job` row, and a background worker (a single polling thread,
+started with the app) claims each job, runs it through the extraction pipeline, and retries
+transient failures up to twice before marking it failed. Once every job in a batch reaches a
+terminal state, a coordinator flips the batch to `COMPLETED` (or `COMPLETED_WITH_WARNINGS` if any
+file was excluded at intake or processing). `GET /batches/{id}` reports batch counters and
+per-job status. A "completed" job here means *the PDF's text was extracted* — no bank detection,
+parsers, `Statement` rows, or analytics yet.
+
+Next up is bank detection and parsing (`build-plan.md` #6). Progress is logged in
 [`docs/activity.md`](./docs/activity.md), and written up for humans as a build log at
 [kervintznoel.com/posts](https://kervintznoel.com/posts/build-log-1-a-window-that-says-ok).
 
