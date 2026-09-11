@@ -5,6 +5,7 @@ must-test area.
 
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,7 @@ from app.services.extraction import ExtractionFailedError
 from app.workers import processor
 from app.workers.coordinator import refresh_batch
 from app.workers.pool import BackgroundWorker, run_worker_once
-from app.workers.queue import claim_next_job, enqueue_job
+from app.workers.queue import claim_next_job, enqueue_job, reclaim_processing_jobs
 
 
 def _batch(session: Session, **overrides: object) -> Batch:
@@ -270,6 +271,93 @@ def test_intake_rejection_alone_makes_a_batch_complete_with_warnings(
 
     session.expire_all()
     assert session.get(Batch, batch.id).status == "COMPLETED_WITH_WARNINGS"
+
+
+# --- crash/restart recovery -------------------------------------------------
+
+
+def test_reclaim_processing_jobs_requeues_regardless_of_age(
+    session: Session, queued_job: StatementJob
+):
+    claim_next_job(session)  # -> PROCESSING, updated_at just now
+
+    reclaimed = reclaim_processing_jobs(session)
+
+    assert reclaimed == [queued_job.batch_id]
+    session.expire_all()
+    job = session.get(StatementJob, queued_job.id)
+    assert job.status == "RETRYING"
+    assert job.attempt_count == 1
+    assert "interrupted" in job.failure_reason
+
+
+def test_reclaim_processing_jobs_at_max_attempts_fails_instead_of_retrying(
+    session: Session, queued_job: StatementJob
+):
+    claim_next_job(session)
+    session.expire_all()
+    job = session.get(StatementJob, queued_job.id)
+    job.attempt_count = job.max_attempts - 1
+    session.add(job)
+    session.commit()
+
+    reclaim_processing_jobs(session)
+
+    session.expire_all()
+    job = session.get(StatementJob, queued_job.id)
+    assert job.status == "FAILED"
+    assert job.attempt_count == job.max_attempts
+
+
+def test_reclaim_processing_jobs_leaves_a_recent_job_alone_when_min_age_set(
+    session: Session, queued_job: StatementJob
+):
+    claim_next_job(session)  # updated_at ~ now
+
+    assert reclaim_processing_jobs(session, min_age_seconds=60) == []
+
+    session.expire_all()
+    # untouched -- the worker may still legitimately be on it
+    assert session.get(StatementJob, queued_job.id).status == "PROCESSING"
+
+
+def test_reclaim_processing_jobs_reclaims_once_stale_enough(
+    session: Session, queued_job: StatementJob
+):
+    claim_next_job(session)
+    session.expire_all()
+    job = session.get(StatementJob, queued_job.id)
+    job.updated_at = datetime.now(UTC) - timedelta(seconds=120)
+    session.add(job)
+    session.commit()
+
+    reclaimed = reclaim_processing_jobs(session, min_age_seconds=60)
+
+    assert reclaimed == [queued_job.batch_id]
+    session.expire_all()
+    assert session.get(StatementJob, queued_job.id).status == "RETRYING"
+
+
+def test_reclaim_processing_jobs_scoped_to_one_batch(session: Session, tmp_path: Path):
+    batch_a = _batch(session)
+    batch_b = _batch(session)
+    fa = _accepted_file(session, batch_a, _pdf(tmp_path, "a.pdf"))
+    fb = _accepted_file(session, batch_b, _pdf(tmp_path, "b.pdf"))
+    job_a = enqueue_job(
+        session, batch_id=batch_a.id, intake_file_id=fa.id, pdf_path=fa.temp_path
+    )
+    job_b = enqueue_job(
+        session, batch_id=batch_b.id, intake_file_id=fb.id, pdf_path=fb.temp_path
+    )
+    claim_next_job(session)
+    claim_next_job(session)
+
+    reclaimed = reclaim_processing_jobs(session, batch_id=batch_a.id)
+
+    assert reclaimed == [batch_a.id]
+    session.expire_all()
+    assert session.get(StatementJob, job_a.id).status == "RETRYING"
+    assert session.get(StatementJob, job_b.id).status == "PROCESSING"  # untouched
 
 
 # --- REQ-PROC-003 / 004 --------------------------------------------------

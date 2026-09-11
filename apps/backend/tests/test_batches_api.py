@@ -228,3 +228,78 @@ def test_reuploading_a_statement_in_a_second_batch_is_deduped(
     ).all()
     assert len(live) == 10  # the synthetic statement has 10 transactions
     assert len(duped) == 10  # the whole re-upload
+
+
+def test_retry_batch_404_for_unknown_id(client: TestClient):
+    assert client.post("/batches/does-not-exist/retry").status_code == 404
+
+
+def test_retry_batch_409_when_not_processing(client: TestClient):
+    files = [("files", ("notes.txt", b"hello", "text/plain"))]
+    batch_id = client.post("/batches", files=files).json()["batch_id"]
+
+    response = client.post(f"/batches/{batch_id}/retry")
+
+    assert response.status_code == 409
+    assert "FAILED" in response.json()["detail"]
+
+
+def test_retry_batch_409_when_nothing_stale(client: TestClient, session: Session):
+    post = client.post(
+        "/batches",
+        files=[
+            ("files", ("santander.pdf", build_santander_sample(), "application/pdf"))
+        ],
+    ).json()
+    job = session.exec(
+        select(StatementJob).where(StatementJob.batch_id == post["batch_id"])
+    ).one()
+    job.status = "PROCESSING"  # claimed just now -- may still be running
+    session.add(job)
+    session.commit()
+
+    response = client.post(f"/batches/{post['batch_id']}/retry")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "no stalled jobs to retry -- batch is still actively processing"
+    )
+
+
+def test_retry_batch_reclaims_a_stale_processing_job(
+    client: TestClient,
+    session: Session,
+    session_factory: Callable[[], Session],
+):
+    from datetime import UTC, datetime, timedelta
+
+    post = client.post(
+        "/batches",
+        files=[
+            ("files", ("santander.pdf", build_santander_sample(), "application/pdf"))
+        ],
+    ).json()
+    job = session.exec(
+        select(StatementJob).where(StatementJob.batch_id == post["batch_id"])
+    ).one()
+    job.status = "PROCESSING"
+    job.updated_at = datetime.now(UTC) - timedelta(seconds=120)
+    session.add(job)
+    session.commit()
+
+    response = client.post(f"/batches/{post['batch_id']}/retry")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["reclaimed"] == 1
+    assert body["status"] == "PROCESSING"  # now RETRYING, not yet terminal
+
+    session.expire_all()
+    job = session.get(StatementJob, job.id)
+    assert job.status == "RETRYING"
+    assert job.attempt_count == 1
+
+    # a reclaimed job is picked back up like any other RETRYING job
+    assert run_worker_once(session_factory) is True
+    session.expire_all()
+    assert session.get(StatementJob, job.id).status == "COMPLETED"

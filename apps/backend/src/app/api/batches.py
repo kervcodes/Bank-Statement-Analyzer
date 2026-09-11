@@ -14,11 +14,16 @@ from sqlmodel import Session, col, func, select
 from app.db import DATA_DIR, get_db_session
 from app.models import Batch, IntakeFile, Statement, StatementJob, Transaction
 from app.services.intake_validation import validate_pdf
-from app.workers.queue import enqueue_job
+from app.workers.coordinator import refresh_batch
+from app.workers.queue import enqueue_job, reclaim_processing_jobs
 
 router = APIRouter(prefix="/batches", tags=["batches"])
 
 TEMP_DIR = DATA_DIR / "tmp"
+
+# A job younger than this may genuinely still be in flight -- only startup
+# recovery (no worker running yet) skips this check.
+STALE_PROCESSING_SECONDS = 60
 
 
 class IntakeFileResult(BaseModel):
@@ -92,6 +97,12 @@ class BatchListResponse(BaseModel):
     page: int
     page_size: int
     total: int
+
+
+class BatchRetryResponse(BaseModel):
+    batch_id: str
+    status: str
+    reclaimed: int
 
 
 @router.post("", response_model=BatchIntakeResponse)
@@ -330,4 +341,40 @@ def get_batch(
             )
             for s in statements
         ],
+    )
+
+
+@router.post("/{batch_id}/retry", response_model=BatchRetryResponse)
+def retry_batch(
+    batch_id: str,
+    session: Session = Depends(get_db_session),  # noqa: B008
+) -> BatchRetryResponse:
+    """Reclaim jobs orphaned by a crash or restart -- the manual escape hatch
+    for a batch stuck at "Processing" with no other way to act on it.
+
+    Only reclaims jobs stale for STALE_PROCESSING_SECONDS: the worker may
+    legitimately still be on one, and stealing it out from under an in-flight
+    run would race the worker's own commit.
+    """
+    batch = session.get(Batch, batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="batch not found")
+    if batch.status != "PROCESSING":
+        raise HTTPException(
+            status_code=409, detail=f"batch is {batch.status}, nothing to retry"
+        )
+
+    reclaimed = reclaim_processing_jobs(
+        session, batch_id=batch_id, min_age_seconds=STALE_PROCESSING_SECONDS
+    )
+    if not reclaimed:
+        raise HTTPException(
+            status_code=409,
+            detail="no stalled jobs to retry -- batch is still actively processing",
+        )
+
+    refresh_batch(session, batch_id)
+    session.refresh(batch)
+    return BatchRetryResponse(
+        batch_id=batch.id, status=batch.status, reclaimed=len(reclaimed)
     )
