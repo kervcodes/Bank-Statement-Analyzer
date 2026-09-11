@@ -82,3 +82,41 @@ export function formatBytes(n: number): string {
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
   return `${(n / 1024 / 1024).toFixed(1)} MB`
 }
+
+/** Integer cents -> "$1,234.56" (or "-$1,234.56"). Always 2dp, comma grouped;
+ *  callers pair it with `direction` / sign, this never guesses one. */
+export function formatCents(cents: number): string {
+  const amount = Math.abs(cents) / 100
+  const formatted = amount.toLocaleString(undefined, {
+    style: 'currency',
+    currency: 'USD',
+  })
+  return cents < 0 ? `-${formatted}` : formatted
+}
+
+/** "-$142.19" for a debit, "+$1,200.00" for a credit -- the signed form used
+ *  next to a transaction row. */
+export function formatSignedCents(cents: number, direction: 'CREDIT' | 'DEBIT'): string {
+  const sign = direction === 'CREDIT' ? '+' : '-'
+  return `${sign}${formatCents(Math.abs(cents))}`
+}
+
+const CATEGORY_SOURCE_LABEL: Record<string, string> = {
+  USER: 'Set by you',
+  MERCHANT_RULE: 'Merchant rule',
+  RULE: 'Predicted (rule)',
+  LLM: 'Predicted (AI)',
+  NONE: 'Needs review',
+}
+
+export const categorySourceLabel = (source: string): string =>
+  CATEGORY_SOURCE_LABEL[source] ?? source
+
+/** "YYYY-MM" -> "January 2026". */
+export function formatMonth(period: string): string {
+  const [year, month] = period.split('-').map(Number)
+  return new Date(year, month - 1, 1).toLocaleDateString(undefined, {
+    year: 'numeric',
+    month: 'long',
+  })
+}

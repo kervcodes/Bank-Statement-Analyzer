@@ -13,11 +13,16 @@ from pydantic import BaseModel
 from sqlmodel import Session, col, func, select
 
 from app.db import get_db_session
-from app.models import CATEGORIES, Statement, Transaction
+from app.models import CATEGORIES, Statement, Transaction, is_spending_category
 from app.services.categorization import recategorize_transaction
 from app.services.ledger import ledger_query
 
 router = APIRouter(prefix="/transactions", tags=["transactions"])
+
+# Same rule the analytics engine uses for its spending totals
+# (app/services/analytics.py: is_spending_category + DEBIT). Precomputed once
+# so the filter is a plain SQL IN rather than a per-row Python check.
+_SPENDING_CATEGORIES = [c for c in CATEGORIES if is_spending_category(c)]
 
 _SORTS = {
     "date_desc": (col(Transaction.transaction_date).desc(), col(Transaction.id).desc()),
@@ -98,6 +103,7 @@ def list_transactions(
     date_from: date | None = None,
     date_to: date | None = None,
     include_duplicates: bool = False,
+    spending_only: bool = False,
     sort: str = Query(default="date_desc"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=100),
@@ -125,6 +131,12 @@ def list_transactions(
                 select(Statement.id).where(col(Statement.batch_id) == batch_id)
             )
         )
+    if spending_only:
+        # Mirrors the analytics engine's spending total exactly (REQ-RPT-101):
+        # a Dashboard drill-through must show precisely the rows behind the
+        # number, not every debit in the range.
+        filters.append(col(Transaction.direction) == "DEBIT")
+        filters.append(col(Transaction.category).in_(_SPENDING_CATEGORIES))
 
     base = ledger_query(include_duplicates=include_duplicates).where(*filters)
 

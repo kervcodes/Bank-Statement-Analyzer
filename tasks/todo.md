@@ -167,4 +167,39 @@ surface) → F3 (Dashboard) → F4 (Review) → F5/F6.
 
 ## Review
 
-_(filled in when PR 2 is done)_
+**Done:** B1–B3 backend (committed 2026-09-08, `fd3a590`), plus one backend addition this
+session — `GET /transactions?spending_only=true` (`_SPENDING_CATEGORIES`, the same rule
+`analytics.py` uses) so the Spending stat card's drill-through can show exactly the rows behind
+its number, which the existing single-category filter couldn't express. F0–F6 frontend: the
+`Sheet`/`Select` primitives, `TransactionDrawer` (linkable via `?txn=<id>`, mounted once in the
+shell), `TransactionListSheet` (the shared drill-through), `DashboardRoute` (coverage bar, stat
+cards, `CashFlowChart` + `SpendingDonut` with table fallbacks, recurring charges, top merchants,
+AI panel), `ReviewRoute` (three sections, sidebar badge = the sum), and the Sidebar badge wiring.
+
+**Owner corrections, both honored:** the Spending stat card computes the latest *full* calendar
+month client-side (`lib/dashboard.ts`) rather than trusting the backend's `trends`, which doesn't
+exclude a partial current month; the Review category action's button always names both the
+merchant and the target category explicitly, never a generic "Categorize."
+
+**Tests:** 20 new frontend tests + 1 new backend test (`spending_only`). 245 backend tests
+(97.8% coverage, ruff clean), 39 frontend tests, `pnpm lint` / `typecheck` / `build` all clean.
+
+**Verified against real data, not just mocks:** ran the actual backend against the real dev DB
+and a standalone Vite dev server (browser-driven, not Electron, so `claude-in-chrome` could
+drive it) — real cash-flow/spending numbers rendered, a merchant drill-through opened the list
+sheet, a row opened the drawer stacked on top, a category edit persisted and the Dashboard's
+Uncategorized total dropped on the next view, and a merchant-wide rule wrote and removed that
+group from Review live. Found and fixed one real environment bug in the process (see below).
+
+**Known issue found and fixed (not a code bug):** a backend process left running from earlier
+manual verification (old code, pre-dating this branch's endpoints) was still bound to port 8420,
+silently serving 404s for every new route. Killed it and started a fresh instance from this
+branch's checkout before re-verifying. Worth remembering: `pnpm dev` / a manually-started
+`uvicorn` can outlive the terminal session that started it — check `netstat -ano | findstr :8420`
+if new endpoints 404 unexpectedly.
+
+**Not built (PR 3, out of scope here):** Accounts, Settings + Electron `safeStorage`,
+`GET /accounts`.
+
+**Recommended next step:** owner review (branch `feature/dashboard-review`, rebased onto
+`fix/stale-processing-jobs`'s merge), then merge to `main`; build-plan #9 PR 3 next.

@@ -154,6 +154,7 @@ def _row(
     dedup: str = "UNIQUE",
     duplicate_of_id: str | None = None,
     account_id: str | None = None,
+    direction: str = "DEBIT",
 ) -> Transaction:
     t = Transaction(
         statement_id=stmt.id,
@@ -163,7 +164,7 @@ def _row(
         description_raw=merchant,
         description_normalized=merchant,
         amount_cents=amount,
-        direction="DEBIT",
+        direction=direction,
         source_bank="Santander",
         source_page=1,
         merchant_normalized=merchant,
@@ -263,6 +264,29 @@ def test_list_filters(client: TestClient, ledger):
         client.get("/transactions", params={"account_id": "acct-x"}).json()["total"]
         == 1
     )
+
+
+def test_spending_only_excludes_transfers_and_credits(
+    client: TestClient, session: Session, ledger
+):
+    """REQ-RPT-101: a Dashboard drill-through must show exactly the rows behind
+    the spending number -- transfers and income never count as spending."""
+    batch = session.get(Batch, ledger["batch_id"])
+    s = _stmt(session, batch=batch)
+    _row(session, s, day=date(2026, 4, 1), amount=50000, category="Transfers")
+    _row(
+        session,
+        s,
+        day=date(2026, 4, 2),
+        amount=200000,
+        category="Income",
+        direction="CREDIT",
+    )
+
+    body = client.get("/transactions", params={"spending_only": "true"}).json()
+
+    assert body["total"] == 3  # the 3 original spending rows, none of the new ones
+    assert all(i["category"] not in ("Transfers", "Income") for i in body["items"])
 
 
 def test_list_sort_and_pagination(client: TestClient, ledger):

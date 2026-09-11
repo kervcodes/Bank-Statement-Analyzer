@@ -1046,3 +1046,82 @@ clean.
 
 **Next step:** owner review, then merge; restart the real backend so the startup recovery
 reclaims the actual stuck batch `7af8bba1`.
+
+**Update, same day:** merged (PR #16). Restarting the real backend reclaimed and fully
+reprocessed the stuck batch `7af8bba1` (and others also orphaned the same way) against the real
+source PDFs — confirmed live via the History screen, all batches reached a terminal status.
+
+## 2026-09-11 — Dashboard + Review + transaction drawer (build-plan #9, PR 2 of 3)
+
+**Backend** (`app/api/transactions.py`, `app/api/review.py`, `app/services/ledger.py` —
+committed 2026-09-08 as part of this branch, `fd3a590`): `GET /transactions/{id}` (the drawer's
+data, always carrying a `source` block for REQ-RPT-003 traceability), filtered/paginated
+`GET /transactions` over the deduplicated ledger (a `ledger_query()` helper factored out of
+`ledger.py`), and `POST /review/duplicates/{id}` (`keep_both` → `UNIQUE`, `confirm` →
+`DUPLICATE`, never deletes a row, safe to re-run). No migration. 234 tests at the time.
+
+**Backend addition, this session:** `GET /transactions` gained `spending_only: bool = False`
+(`_SPENDING_CATEGORIES` — the exact same rule `services/analytics.py` uses for its spending
+totals: `DEBIT` + `is_spending_category`). Needed so the Dashboard's Spending stat card can drill
+through to *precisely* the rows behind its number — the existing single-category filter can't
+express "any spending category." 1 new test (`test_spending_only_excludes_transfers_and_credits`).
+245 backend tests, 97.8% coverage.
+
+**Frontend** (`apps/desktop`), following the owner-approved plan in `tasks/todo.md` build order
+(F0 → F1+F2 → F3 → F4 → F5/F6):
+
+- **F0 primitives** — `@radix-ui/react-dialog` (a hand-vendored `Sheet`, right-side panel + Esc
+  + focus trap) and `recharts`. A native `<select>`-based `Select` (no combobox needed for a
+  short fixed taxonomy). `lib/api.ts` extended with every new response shape + the taxonomy
+  (`CATEGORIES`, mirroring `app/models/taxonomy.py`); `lib/format.ts` gained `formatCents`,
+  `formatSignedCents`, `categorySourceLabel`, `formatMonth`.
+- **F1 `TransactionDrawer`** — mounted once in `App.tsx` (not per-route), opened via `?txn=<id>`
+  so it's linkable/refreshable over whatever screen triggered it (design-notes §3.6). Category
+  edit via the taxonomy `Select` → `PUT /transactions/{id}/category`, invalidates
+  `['transactions']` + `['analytics']` + `['review']` (a per-row fix can be the last uncategorized
+  row for a merchant).
+- **F2 `TransactionListSheet`** — the "click a number → see the rows" drill-through
+  (design-notes principle 4). Filters come from the caller as props; a row opens F1.
+- **F3 Dashboard** (`routes/DashboardRoute.tsx`) — date range (`12m`/`ytd`/`all`) written to the
+  URL; a coverage bar (green/amber, expandable excluded list, links to History); stat cards (net
+  cash flow, spending, top category); `CashFlowChart` + `SpendingDonut` (Recharts, each with a
+  "show as table" toggle per the dataviz skill's accessibility rule); recurring charges + top
+  merchants lists; an AI summary panel in its own visually distinct card (never blended with a
+  number, per design-notes principle 2). Chart colors (`lib/chartColors.ts`) are a fixed-order
+  categorical set deliberately outside the app's status hue family (blue/green/amber/red already
+  mean processing/completed/warning/failed) so a series is never misread as a status signal; the
+  donut caps at 6 slices (dataviz anti-patterns: past that, fold to "Other").
+  - **Owner correction honored:** the Spending stat card is the latest *full* calendar month vs
+    the previous one, excluding the current partial month — computed client-side
+    (`lib/dashboard.ts`'s `latestFullMonthComparison`) from `cash_flow`, not from the backend's
+    `trends` (which uses whatever the most recent period in range is, partial or not). Fewer than
+    two full months → the latest month, no delta, "Not enough prior data".
+- **F4 Review** (`routes/ReviewRoute.tsx`) — one inbox, three sections with counts (possible
+  duplicates, needs a category, failed/unsupported statements read-only from `GET /batches`);
+  `Sidebar.tsx`'s badge = the sum, using the same query keys so mounting both costs no extra
+  fetch.
+  - **Owner correction honored:** the merchant-wide category action never silently writes a rule
+    — the button text always spells out both the merchant and the target category ("Always
+    categorize X as Y"); fixing one row instead expands the group and goes through
+    `PUT /transactions/{id}/category` via the drawer.
+- **F5 tests** — 20 new (`lib/dashboard.test.ts`, `TransactionDrawer.test.tsx`,
+  `TransactionListSheet.test.tsx`, `DashboardRoute.test.tsx`, `ReviewRoute.test.tsx`). 39 frontend
+  tests pass; `pnpm lint` / `pnpm typecheck` / `pnpm build` all clean.
+- **F6 docs** — this entry; `README.md` frontend-status paragraph updated;
+  `docs/manual-verification-frontend-pr2.md` (new); `tasks/todo.md` Review filled in.
+
+**Verified against the real dev DB** (real backend + a standalone Vite dev server, not just
+mocked tests): Dashboard renders real cash-flow/spending/coverage numbers; a merchant-row click
+opens the list sheet, a row click stacks the drawer on top and a category edit persists and
+correctly drops the Dashboard's Uncategorized total on the next view; Review's "Needs a
+category" count matches the sidebar badge exactly, and applying a merchant rule removes that
+group live. Caught and fixed one real bug in the process: a stale backend process (left running
+from earlier manual verification, on old code) was still bound to port 8420, serving 404s for
+every new endpoint — killed it and started a fresh instance from this branch.
+
+**Not done (PR 3):** Accounts, Settings + Electron `safeStorage`, `GET /accounts`.
+
+**Repo note:** branch `feature/dashboard-review` off `main`, rebased onto
+`fix/stale-processing-jobs`'s merge (`dde6293`) after that PR landed.
+
+**Next step:** owner review, then merge; build-plan #9 PR 3 (Accounts + Settings).
