@@ -27,6 +27,7 @@ from app.services.financial_validation import validate_statement
 from app.services.normalization import normalize
 from app.workers.coordinator import refresh_batch
 from app.workers.queue import (
+    cleanup_pdf_if_terminal,
     mark_completed,
     mark_failed,
     mark_unsupported,
@@ -79,4 +80,5 @@ def process_job(session: Session, job: StatementJob) -> None:
         logger.exception("job %s failed with a non-retryable error", job.id)
         mark_failed(session, job, f"{type(exc).__name__}: {exc}")
 
+    cleanup_pdf_if_terminal(job)
     refresh_batch(session, job.batch_id)

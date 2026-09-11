@@ -260,6 +260,11 @@ export interface RuleWriteResponse {
   transactions_recategorized: number
 }
 
+export interface CategoryRuleOut {
+  merchant: string
+  category: string
+}
+
 export interface PeriodCashFlow {
   period: string // "YYYY-MM"
   credits_cents: number
@@ -334,6 +339,28 @@ export interface ExplanationResponse {
   text: string | null
 }
 
+export interface AccountListItem {
+  id: string
+  bank: string
+  account_type: string
+  account_identifier_masked: string
+  statement_count: number
+  period_start: string | null
+  period_end: string | null
+}
+
+export interface AccountListResponse {
+  items: AccountListItem[]
+  page: number
+  page_size: number
+  total: number
+}
+
+export interface TestLlmKeyResponse {
+  ok: boolean
+  error: string | null
+}
+
 // --- calls ---------------------------------------------------------------
 
 function qs(params: Record<string, string | number | boolean | undefined>) {
@@ -402,6 +429,8 @@ export const api = {
 
   getUncategorized: () => request<UncategorizedResponse>('/review/categorizations'),
 
+  listCategoryRules: () => request<CategoryRuleOut[]>('/category-rules'),
+
   upsertCategoryRule: (merchant: string, category: string) =>
     request<RuleWriteResponse>('/category-rules', {
       method: 'PUT',
@@ -409,11 +438,26 @@ export const api = {
       body: JSON.stringify({ merchant, category }),
     }),
 
+  deleteCategoryRule: (merchant: string) =>
+    request<RuleWriteResponse>(`/category-rules/${encodeURIComponent(merchant)}`, {
+      method: 'DELETE',
+    }),
+
   getAnalytics: (start?: string, end?: string) =>
     request<Analytics>(`/analytics${qs({ start, end })}`),
 
   getAnalyticsExplanation: (start?: string, end?: string) =>
     request<ExplanationResponse>(`/analytics/explanation${qs({ start, end })}`),
+
+  listAccounts: (page = 1, pageSize = 20) =>
+    request<AccountListResponse>(`/accounts?page=${page}&page_size=${pageSize}`),
+
+  testLlmKey: (provider: 'anthropic' | 'openai', apiKey: string, model?: string) =>
+    request<TestLlmKeyResponse>('/settings/test-llm-key', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider, api_key: apiKey, model }),
+    }),
 }
 
 export const BATCH_TERMINAL = new Set([

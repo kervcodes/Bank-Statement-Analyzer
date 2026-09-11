@@ -14,18 +14,34 @@ no extra cost.
 
 import logging
 from dataclasses import dataclass
+from typing import Literal
 
+from app.llm.anthropic_provider import AnthropicProvider
 from app.llm.base import CategorySuggestion, LLMProvider, LLMUnavailable
 from app.llm.null import NullProvider
+from app.llm.openai_provider import OpenAIProvider
 from app.llm.providers import configured_providers
 from app.services.analytics import Analytics
 from app.services.privacy_gateway import (
+    OutboundTransaction,
     PrivacyBlockedError,
     build_categorization_payload,
     build_explanation_payload,
 )
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_MODEL = {"anthropic": "claude-sonnet-5", "openai": "gpt-5.6-luna"}
+
+# A minimal, fixed payload for REQ-SET-001's "test connection" -- cheap and
+# fast (categorize, not explain: no extended thinking, ~120 max_tokens). Only
+# whether the call raises LLMUnavailable matters; the suggestion is discarded.
+_PING_TRANSACTION = OutboundTransaction(
+    merchant="Test Merchant",
+    description="Test transaction",
+    amount="1.00",
+    direction="debit",
+)
 
 
 @dataclass(frozen=True)
@@ -68,6 +84,25 @@ def suggest_category(
             return provider.categorize(payload)
         except LLMUnavailable:
             continue
+    return None
+
+
+def test_provider_key(
+    provider: Literal["anthropic", "openai"], api_key: str, model: str | None = None
+) -> str | None:
+    """REQ-SET-001: verify an API key works before it's saved. Returns ``None``
+    on success, or an error string (provider name + exception class only --
+    never payload content) on failure. Stateless -- never persists or logs the
+    key; the only call site is `app/api/settings.py`."""
+    instance: LLMProvider = (
+        AnthropicProvider(api_key, model or _DEFAULT_MODEL["anthropic"])
+        if provider == "anthropic"
+        else OpenAIProvider(api_key, model or _DEFAULT_MODEL["openai"])
+    )
+    try:
+        instance.categorize(_PING_TRANSACTION)
+    except LLMUnavailable as exc:
+        return str(exc)
     return None
 
 

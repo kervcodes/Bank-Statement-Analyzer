@@ -18,7 +18,13 @@ from app.services.extraction import ExtractionFailedError
 from app.workers import processor
 from app.workers.coordinator import refresh_batch
 from app.workers.pool import BackgroundWorker, run_worker_once
-from app.workers.queue import claim_next_job, enqueue_job, reclaim_processing_jobs
+from app.workers.queue import (
+    claim_next_job,
+    cleanup_pdf_if_terminal,
+    enqueue_job,
+    mark_completed,
+    reclaim_processing_jobs,
+)
 
 
 def _batch(session: Session, **overrides: object) -> Batch:
@@ -358,6 +364,78 @@ def test_reclaim_processing_jobs_scoped_to_one_batch(session: Session, tmp_path:
     session.expire_all()
     assert session.get(StatementJob, job_a.id).status == "RETRYING"
     assert session.get(StatementJob, job_b.id).status == "PROCESSING"  # untouched
+
+
+# --- raw PDF cleanup (REQ-CLEAN-001) ----------------------------------------
+
+
+def test_cleanup_pdf_if_terminal_deletes_a_completed_jobs_pdf(
+    session: Session, queued_job: StatementJob
+):
+    path = Path(queued_job.pdf_path)
+    assert path.exists()
+    mark_completed(session, queued_job, method="NATIVE", page_count=1)
+
+    cleanup_pdf_if_terminal(queued_job)
+
+    assert not path.exists()
+
+
+def test_cleanup_pdf_if_terminal_leaves_a_retrying_job_alone(
+    session: Session, queued_job: StatementJob
+):
+    path = Path(queued_job.pdf_path)
+    claim_next_job(session)
+    reclaim_processing_jobs(session)  # -> RETRYING (fresh job, attempt 1 of 3)
+    session.expire_all()
+    job = session.get(StatementJob, queued_job.id)
+    assert job.status == "RETRYING"
+
+    cleanup_pdf_if_terminal(job)
+
+    assert path.exists()
+
+
+def test_cleanup_pdf_if_terminal_respects_the_retain_setting(
+    session: Session, queued_job: StatementJob, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("APP_RETAIN_RAW_PDFS", "1")
+    path = Path(queued_job.pdf_path)
+    mark_completed(session, queued_job, method="NATIVE", page_count=1)
+
+    cleanup_pdf_if_terminal(queued_job)
+
+    assert path.exists()
+
+
+def test_reclaim_straight_to_failed_also_cleans_up_the_pdf(
+    session: Session, queued_job: StatementJob
+):
+    path = Path(queued_job.pdf_path)
+    claim_next_job(session)
+    session.expire_all()
+    job = session.get(StatementJob, queued_job.id)
+    job.attempt_count = job.max_attempts - 1  # this reclaim exhausts attempts
+    session.add(job)
+    session.commit()
+
+    reclaim_processing_jobs(session)
+
+    session.expire_all()
+    assert session.get(StatementJob, queued_job.id).status == "FAILED"
+    assert not path.exists()
+
+
+def test_a_completed_job_run_through_the_worker_has_its_pdf_deleted(
+    session: Session,
+    session_factory: Callable[[], Session],
+    queued_job: StatementJob,
+):
+    path = Path(queued_job.pdf_path)
+
+    assert run_worker_once(session_factory) is True
+
+    assert not path.exists()
 
 
 # --- REQ-PROC-003 / 004 --------------------------------------------------

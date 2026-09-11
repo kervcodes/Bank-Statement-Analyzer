@@ -79,8 +79,13 @@ spending-by-category donut — each with a "show as table" fallback, recurring c
 merchants, and an optional AI summary panel) and **Review** (one inbox for possible duplicates,
 low-confidence categorizations, and failed/unsupported statements), plus a shared transaction
 drawer (`?txn=<id>`, linkable) and a filtered transaction list sheet used as the drill-through
-surface from every clickable number. Accounts and Settings follow in part 3. Progress is
-logged in [`docs/activity.md`](./docs/activity.md), and written up for humans as a build log at
+surface from every clickable number. The third and final slice adds **Accounts** (a read-only
+resolved-account list) and **Settings**: an LLM provider/API-key form (test-before-save against
+the real provider, `safeStorage`-encrypted on this machine, the backend never persists a
+secret), a raw-PDF retention toggle that's actually enforced (a completed job's PDF is deleted
+unless retention is on), and the category-rule table. This closes out build-plan #9; #10
+(packaging) is next. Progress is logged in [`docs/activity.md`](./docs/activity.md), and written
+up for humans as a build log at
 [kervintznoel.com/posts](https://kervintznoel.com/posts/build-log-1-a-window-that-says-ok).
 
 ## What it does (v1)

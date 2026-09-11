@@ -1,15 +1,33 @@
 """Create, claim, and transition statement_job rows. Pure DB, no FastAPI/OCR imports."""
 
+import os
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from sqlalchemy import update
 from sqlmodel import Session, col, select
 
-from app.models import CLAIMABLE_JOB_STATUSES, StatementJob
+from app.models import CLAIMABLE_JOB_STATUSES, TERMINAL_JOB_STATUSES, StatementJob
 
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def cleanup_pdf_if_terminal(job: StatementJob) -> None:
+    """REQ-CLEAN-001: delete a job's raw PDF once it reaches a terminal status,
+    unless the user opted to retain originals (REQ-SET-002). A `RETRYING` job
+    still needs the file for its next attempt, so this is a no-op for those.
+
+    `APP_RETAIN_RAW_PDFS` is set by Electron (from the safeStorage-backed
+    settings file) when it spawns the backend -- the same mechanism the LLM
+    provider config already uses (`app/llm/providers.py`).
+    """
+    if job.status not in TERMINAL_JOB_STATUSES:
+        return
+    if os.environ.get("APP_RETAIN_RAW_PDFS") == "1":
+        return
+    Path(job.pdf_path).unlink(missing_ok=True)
 
 
 def enqueue_job(
@@ -150,6 +168,7 @@ def reclaim_processing_jobs(
         )
         job.updated_at = _utcnow()
         session.add(job)
+        cleanup_pdf_if_terminal(job)  # a reclaim can land straight on FAILED
         reclaimed_batch_ids.append(job.batch_id)
 
     if reclaimed_batch_ids:
