@@ -9,7 +9,10 @@ from app.api.batches import router as batches_router
 from app.api.category_rules import router as category_rules_router
 from app.api.review import router as review_router
 from app.api.transactions import router as transactions_router
+from app.db import get_session
+from app.workers.coordinator import refresh_batch
 from app.workers.pool import BackgroundWorker
+from app.workers.queue import reclaim_processing_jobs
 
 # Started on app startup, stopped on shutdown. Bare TestClient(app) does not
 # trigger lifespan events, so the suite runs with the worker off and drives it
@@ -19,6 +22,11 @@ worker = BackgroundWorker()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    # No worker has run yet, so any job still PROCESSING was orphaned by a
+    # previous crash or restart -- reclaim all of them before starting.
+    with get_session() as session:
+        for reclaimed_batch_id in set(reclaim_processing_jobs(session)):
+            refresh_batch(session, reclaimed_batch_id)
     worker.start()
     try:
         yield

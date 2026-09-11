@@ -1004,3 +1004,45 @@ supposed to show; the JS pre-check is the single gate now. shadcn primitives are
 **Repo note:** branch `feature/frontend-screens` off `main` (PR #14 merged).
 
 **Next step:** build-plan #9 PR 2 — Dashboard + Review + the transaction drawer.
+
+## 2026-09-11 — Recover orphaned PROCESSING jobs (fix, off-plan)
+
+**Prompt:** the user imported a few PDFs and the History screen showed batch `7af8bba1` stuck
+at "Processing, 0/6" since the day before, with no way to act on it. "Perform these steps in a
+different branch."
+
+**Root cause:** `CLAIMABLE_JOB_STATUSES = ("QUEUED", "RETRYING")` (`models/jobs.py`) excludes
+`PROCESSING`. If the backend dies or restarts while a job is claimed, that job is orphaned
+forever — nothing ever reclaims it, so `refresh_batch` never sees all-terminal and the batch
+stays `PROCESSING` indefinitely. Confirmed directly in the dev DB: all 6 jobs on batch
+`7af8bba1` were `PROCESSING`, `attempt_count: 0`, `updated_at` staggered ~1.7s apart —
+consistent with the backend restarting repeatedly and each restart claiming the next queued job
+before dying again. There was also no API to inspect or act on a stuck batch.
+
+**Fix:** `reclaim_processing_jobs()` (`app/workers/queue.py`) — requeues `PROCESSING` jobs
+(optionally scoped to one batch, optionally only those stale for `min_age_seconds`), counting
+the reclaim as one more attempt so a job that keeps getting orphaned still stops at
+`max_attempts` instead of retrying forever. Two callers:
+- **Startup recovery** — `main.py`'s lifespan calls it with no filters before `worker.start()`;
+  no worker is running yet, so every `PROCESSING` row is guaranteed orphaned.
+- **`POST /batches/{batch_id}/retry`** (`api/batches.py`) — the manual escape hatch. Only
+  reclaims jobs stale for 60s+ (`STALE_PROCESSING_SECONDS`), since the worker may legitimately
+  still be on one; 404 unknown batch, 409 if the batch isn't `PROCESSING` or nothing is stale
+  enough to reclaim.
+
+**Not built (documented follow-up):** a hard timeout around OCR extraction
+(`services/extraction.py` has none). Doing that properly needs process isolation, which
+conflicts with the existing intentional single-thread worker design (`pool.py`'s module
+docstring) — bigger change than this bug needed today.
+
+**Tests:** 8 new (`test_job_queue.py` — reclaim regardless of age, at-`max_attempts` goes
+straight to `FAILED`, min-age guard, scoped to one batch; `test_batches_api.py` — 404/409/200 for
+the retry endpoint; `test_main.py` — lifespan wiring, `get_session` and the worker stubbed so it
+never touches the real app database or thread). 233 backend tests pass, 97.6% coverage, ruff
+clean.
+
+**Repo note:** branch `fix/stale-processing-jobs` off `main`, independent of
+`fix/auto-migrate-on-startup` (that branch's completed work is stashed, untouched by this one).
+
+**Next step:** owner review, then merge; restart the real backend so the startup recovery
+reclaims the actual stuck batch `7af8bba1`.

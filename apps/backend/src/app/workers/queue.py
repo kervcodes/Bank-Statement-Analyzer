@@ -1,6 +1,6 @@
 """Create, claim, and transition statement_job rows. Pure DB, no FastAPI/OCR imports."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import update
 from sqlmodel import Session, col, select
@@ -108,3 +108,51 @@ def record_retryable_failure(session: Session, job: StatementJob, reason: str) -
     job.status = "RETRYING" if job.attempt_count < job.max_attempts else "FAILED"
     session.add(job)
     session.commit()
+
+
+def reclaim_processing_jobs(
+    session: Session,
+    *,
+    batch_id: str | None = None,
+    min_age_seconds: float | None = None,
+) -> list[str]:
+    """Requeue PROCESSING jobs orphaned by a crash or restart.
+
+    PROCESSING is deliberately excluded from CLAIMABLE_JOB_STATUSES, so a job
+    that never reaches a terminal status because the process died mid-job would
+    otherwise sit there forever and keep its batch stuck at "Processing".
+
+    No worker is running before app startup, so every PROCESSING row is
+    guaranteed orphaned then -- call with no filters. At runtime the worker may
+    legitimately still be on a job, so `min_age_seconds` guards against
+    reclaiming one that is actually in flight.
+
+    Counts as one more attempt, same as any other failed attempt, so a job
+    that keeps getting orphaned still stops at `max_attempts` instead of
+    retrying forever. Returns the batch_id of each job reclaimed (one entry
+    per job, batches may repeat) so the caller knows which batches to
+    re-evaluate.
+    """
+    query = select(StatementJob).where(col(StatementJob.status) == "PROCESSING")
+    if batch_id is not None:
+        query = query.where(col(StatementJob.batch_id) == batch_id)
+    if min_age_seconds is not None:
+        cutoff = _utcnow() - timedelta(seconds=min_age_seconds)
+        query = query.where(col(StatementJob.updated_at) < cutoff)
+
+    jobs = session.exec(query).all()
+    reclaimed_batch_ids = []
+    for job in jobs:
+        job.attempt_count += 1
+        job.status = "RETRYING" if job.attempt_count < job.max_attempts else "FAILED"
+        job.failure_reason = (
+            "interrupted before finishing (process restarted or job stalled)"
+        )
+        job.updated_at = _utcnow()
+        session.add(job)
+        reclaimed_batch_ids.append(job.batch_id)
+
+    if reclaimed_batch_ids:
+        session.commit()
+
+    return reclaimed_batch_ids
