@@ -180,3 +180,136 @@ def test_uncategorized_lane_groups_by_merchant(client: TestClient, session: Sess
     assert group["merchant"] == "Zzq Vendor"
     assert group["transaction_count"] == 2
     assert group["total_cents"] == 6_000
+
+
+# --- POST /review/duplicates/{id} (build-plan #9 PR 2) --------------------
+
+
+def _flagged_pair(session: Session) -> tuple[str, str]:
+    """A canonical transaction and a POSSIBLE_DUPLICATE pointing at it. Returns
+    (flagged_id, canonical_id)."""
+    batch = Batch(
+        selected=1,
+        uploaded=1,
+        upload_failed=0,
+        validation_failed=0,
+        processed=1,
+        processing_failed=0,
+        status="COMPLETED",
+    )
+    session.add(batch)
+    session.commit()
+
+    def _stmt(start: date, end: date) -> Statement:
+        s = Statement(
+            batch_id=batch.id,
+            bank="Santander",
+            account_type="checking",
+            account_identifier_masked="0520",
+            statement_start_date=start,
+            statement_end_date=end,
+            opening_balance_cents=0,
+            closing_balance_cents=0,
+            parser_version="santander_checking_v1",
+            extraction_status="SUCCESS",
+            validation_result="VALID",
+        )
+        session.add(s)
+        session.commit()
+        return s
+
+    older = _stmt(date(2026, 1, 1), date(2026, 1, 31))
+    newer = _stmt(date(2026, 1, 15), date(2026, 2, 15))
+
+    def _t(stmt: Statement, dedup: str, dup_of: str | None) -> Transaction:
+        t = Transaction(
+            statement_id=stmt.id,
+            transaction_date=date(2026, 1, 20),
+            posted_date=date(2026, 1, 20),
+            description_raw="STARBUCKS",
+            description_normalized="STARBUCKS",
+            amount_cents=782,
+            direction="DEBIT",
+            source_bank="Santander",
+            source_page=1,
+            merchant_normalized="Starbucks",
+            category="Dining",
+            category_source="RULE",
+            dedup_status=dedup,
+            duplicate_of_id=dup_of,
+        )
+        session.add(t)
+        session.commit()
+        return t
+
+    canonical = _t(older, "UNIQUE", None)
+    flagged = _t(newer, "POSSIBLE_DUPLICATE", canonical.id)
+    return flagged.id, canonical.id
+
+
+def test_keep_both_marks_unique(client: TestClient, session: Session):
+    flagged, _ = _flagged_pair(session)
+    body = client.post(
+        f"/review/duplicates/{flagged}", json={"action": "keep_both"}
+    ).json()
+    assert body["dedup_status"] == "UNIQUE"
+    session.expire_all()
+    assert session.get(Transaction, flagged).duplicate_of_id is None
+    # re-running is a no-op 200
+    assert (
+        client.post(
+            f"/review/duplicates/{flagged}", json={"action": "keep_both"}
+        ).status_code
+        == 200
+    )
+
+
+def test_confirm_marks_duplicate_and_keeps_the_link(
+    client: TestClient, session: Session
+):
+    flagged, canonical = _flagged_pair(session)
+    body = client.post(
+        f"/review/duplicates/{flagged}", json={"action": "confirm"}
+    ).json()
+    assert body["dedup_status"] == "DUPLICATE"
+    session.expire_all()
+    assert session.get(Transaction, flagged).duplicate_of_id == canonical
+    # excluded from the default ledger, visible with include_duplicates
+    assert client.get("/transactions").json()["total"] == 1
+    assert (
+        client.get("/transactions", params={"include_duplicates": "true"}).json()[
+            "total"
+        ]
+        == 2
+    )
+
+
+def test_confirm_without_a_match_is_409(client: TestClient, session: Session):
+    flagged, _ = _flagged_pair(session)
+    t = session.get(Transaction, flagged)
+    t.duplicate_of_id = None
+    session.add(t)
+    session.commit()
+    assert (
+        client.post(
+            f"/review/duplicates/{flagged}", json={"action": "confirm"}
+        ).status_code
+        == 409
+    )
+
+
+def test_action_on_a_non_flagged_txn_is_409(client: TestClient, session: Session):
+    _, canonical = _flagged_pair(session)  # canonical is UNIQUE, never flagged
+    assert (
+        client.post(
+            f"/review/duplicates/{canonical}", json={"action": "confirm"}
+        ).status_code
+        == 409
+    )
+
+
+def test_action_on_unknown_txn_is_404(client: TestClient):
+    assert (
+        client.post("/review/duplicates/nope", json={"action": "keep_both"}).status_code
+        == 404
+    )

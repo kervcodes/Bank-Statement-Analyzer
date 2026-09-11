@@ -73,8 +73,13 @@ The Electron/React frontend (`build-plan.md` #9, landing in three parts) is unde
 slice is live: an app shell (sidebar nav, hash routing, TanStack Query, dark mode off the OS
 theme), an **Import** screen (drag-drop, per-file client pre-check, the backend's per-file
 accept/reject reasons, a non-blocking progress pill), and a **History** screen (`GET /batches`,
-paginated, expand a batch to see its statements and their validation status). Dashboard,
-Review, the transaction drawer, Accounts, and Settings follow in parts 2 and 3. Progress is
+paginated, expand a batch to see its statements and their validation status). The second slice
+adds **Dashboard** (a date-range-scoped coverage bar, stat cards, a cash-flow chart and a
+spending-by-category donut — each with a "show as table" fallback, recurring charges, top
+merchants, and an optional AI summary panel) and **Review** (one inbox for possible duplicates,
+low-confidence categorizations, and failed/unsupported statements), plus a shared transaction
+drawer (`?txn=<id>`, linkable) and a filtered transaction list sheet used as the drill-through
+surface from every clickable number. Accounts and Settings follow in part 3. Progress is
 logged in [`docs/activity.md`](./docs/activity.md), and written up for humans as a build log at
 [kervintznoel.com/posts](https://kervintznoel.com/posts/build-log-1-a-window-that-says-ok).
 
