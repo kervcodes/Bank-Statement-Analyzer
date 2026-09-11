@@ -1,4 +1,5 @@
 import { useEffect } from 'react'
+import type { DesktopSettings, DesktopSettingsPatch } from '../lib/desktopSettings'
 
 /** Applies dark mode from Electron's nativeTheme (via preload), falling back to
  *  the OS media query when running the renderer outside Electron (plain `vite`).
@@ -27,6 +28,8 @@ declare global {
     desktop?: {
       shouldUseDarkColors: () => boolean
       onThemeChange: (cb: (dark: boolean) => void) => () => void
+      getSettings: () => Promise<DesktopSettings>
+      saveSettings: (patch: DesktopSettingsPatch) => Promise<DesktopSettings>
     }
   }
 }

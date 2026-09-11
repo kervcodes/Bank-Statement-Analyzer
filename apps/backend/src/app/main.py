@@ -4,10 +4,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.accounts import router as accounts_router
 from app.api.analytics import router as analytics_router
 from app.api.batches import router as batches_router
 from app.api.category_rules import router as category_rules_router
 from app.api.review import router as review_router
+from app.api.settings import router as settings_router
 from app.api.transactions import router as transactions_router
 from app.db import get_session
 from app.workers.coordinator import refresh_batch
@@ -40,6 +42,8 @@ app.include_router(review_router)
 app.include_router(analytics_router)
 app.include_router(transactions_router)
 app.include_router(category_rules_router)
+app.include_router(accounts_router)
+app.include_router(settings_router)
 
 # Single-user local desktop app: the renderer (Vite dev server or a packaged
 # file:// origin) is always cross-origin from this sidecar on 127.0.0.1, and

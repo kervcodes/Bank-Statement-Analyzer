@@ -1,205 +1,128 @@
-# Todo: Build-plan #9 — PR 2 (Dashboard + Review + transaction drawer)
+# Todo: Build-plan #9 — PR 3 (Accounts + Settings)
 
-Branch `feature/dashboard-review` off `main` (PR #15 merged). Source: `build-plan.md` §9,
-`design-notes.md` §3.1 / §3.4 / §3.6, §4–§6.
+Branch `feature/accounts-settings` off `main` (PR #17 merged). Source: `build-plan.md` §9,
+`design-notes.md` §3.5 / §3.7, `requirements.md` §15 (Settings) / §16 (Retention/Cleanup).
 
-## Scope (strict — from the owner)
+## Scope
 
-**In:** Dashboard, Review, transaction drawer, `GET /transactions/{id}`, filtered/paginated
-`GET /transactions`, duplicate review actions.
-**Out (PR 3):** Accounts, Settings, Electron `safeStorage`, `GET /accounts`. Do not pull any of
-these forward.
+**In:** Accounts (read-only), Settings (LLM provider/keys + test connection, raw-PDF retention
+toggle + actual enforcement, category rules table), `GET /accounts`.
+**Out:** nothing further deferred — this closes out build-plan #9. Next after this is #10
+(Packaging).
 
-## Locked decisions carried from the #9 plan
+## Investigation notes (why this needs a design decision, not just UI)
 
-- Dashboard default range = **last 12 months**; a date-range control is present.
-- Charts = **Recharts**; every financial value must also be reachable as a number / table, not
-  only in a chart (run the `dataviz` skill before writing chart code).
-- Duplicate actions: `keep_both` → `UNIQUE`, `confirm` → `DUPLICATE`. No undo UI; both
-  re-runnable; **never delete the row**; a confirmed duplicate stays queryable but is excluded
-  from analytics. **No migration** — the existing `dedup_status` / `duplicate_of_id` columns
-  are enough.
-- Pagination on every list endpoint. State boundaries: TanStack Query = server; local React
-  state = UI-only; router search params = navigation + filter state. No Redux/Zustand.
-- Foundation stays minimal.
+- **LLM keys today are env-var only** (`app/llm/providers.py` reads `ANTHROPIC_API_KEY` /
+  `OPENAI_API_KEY` / `LLM_PROVIDER` from `os.environ` at call time). There is no settings
+  persistence anywhere yet.
+- **`techstack.md` requires `safeStorage`** for the keys (OS-keychain-backed encryption), which
+  is an Electron/Node API — the Python backend cannot decrypt it directly. Electron is
+  necessarily the only thing that ever sees a decrypted key.
+- **Raw-PDF cleanup doesn't exist at all.** `POST /batches` writes every accepted file to
+  `data/tmp/<batch_id>/<intake_file_id>.pdf` and nothing ever deletes it — a real gap against
+  **REQ-CLEAN-001** (delete after processing unless retention is on), which `requirements.md`
+  §17.2 marks as a security requirement, not optional.
+
+## Design (needs a decision on one point — see below)
+
+**Settings reach the backend the same way it already gets its config: environment variables at
+spawn.** Electron (`electron/main.ts`) already owns `startBackend()`/`stopBackend()`. Adding:
+- A local settings file in Electron's `userData` dir. Non-secret fields (`llmProvider`,
+  `retainRawPdfs`, model names) stored plain; each API key stored as its own
+  `safeStorage.encryptString()` blob. Never written to the SQLite DB (per `techstack.md`).
+- `startBackend()` decrypts the stored keys and passes `LLM_PROVIDER` / `ANTHROPIC_API_KEY` /
+  `ANTHROPIC_MODEL` / `OPENAI_API_KEY` / `OPENAI_MODEL` / `APP_RETAIN_RAW_PDFS` as env vars —
+  exactly the mechanism `app/llm/providers.py` already reads today, plus one new var the
+  processor checks before deleting a job's PDF.
+- A new preload bridge (`window.desktop.getSettings()` / `.saveSettings(patch)`, mirroring the
+  existing `shouldUseDarkColors`/`onThemeChange` pattern) — `getSettings` never returns a
+  decrypted key or its ciphertext to the renderer, only `hasAnthropicKey`/`hasOpenaiKey`
+  booleans, so a saved key is never shown again in plaintext (design-notes §3.7).
+- **Saving settings restarts the backend** (`stopBackend(); startBackend()`) so the new env
+  takes effect immediately. This is the one real trade-off: a brief (sub-second, local-only)
+  interruption on every settings save, in exchange for zero new backend persistence/IPC surface
+  and reusing a mechanism that already exists and is already tested.
+  - *(Alternative considered: an in-memory settings store in the backend + a `PUT` endpoint
+  Electron calls after decrypting, so changes apply with no restart. More backend surface for a
+  screen that gets touched rarely — rejected unless you'd rather not have the restart.)*
+- **"Test connection"** doesn't touch persistence at all: a new stateless
+  `POST /settings/test-llm-key {provider, api_key, model?}` builds a throwaway
+  `AnthropicProvider`/`OpenAIProvider` with the given key and calls `.explain()` on a trivial
+  empty `OutboundAnalytics`; `LLMUnavailable` → `{ok: false, error}`, else `{ok: true}`. Never
+  logs or persists the key (REQ-CLEAN-003).
+- **Retention enforcement**: `app/workers/processor.py`, after a job reaches a *terminal* status
+  (not `RETRYING` — it still needs the file for the next attempt) — delete `job.pdf_path` unless
+  `APP_RETAIN_RAW_PDFS=1`.
+- **Accounts stays read-only.** design-notes §3.5 mentions merging "mis-grouped" accounts, but
+  `Account`'s identity is `(bank, account_type, masked_digits)` under a DB `UNIQUE` constraint —
+  the current architecture cannot produce two provisional accounts that are actually the same
+  one, so there is nothing to merge. Flagging this rather than silently building a merge action
+  that has no real case to handle, or silently dropping a requirement.
 
 ## Backend
 
-### B1. `GET /transactions/{id}` — the drawer's data (`app/api/transactions.py`)
-- Join Transaction → Statement → Account. Response: `id`, `transaction_date`, `posted_date`,
-  `amount_cents`, `direction`, `category`, `category_source`, `predicted_category`,
-  `user_category`, `merchant_normalized`, `description_normalized`, `description_raw`,
-  `dedup_status`, and a **`source`** block that is always present (`statement_id`, `bank`,
-  `account_type`, `account_identifier_masked`, `statement_period` (start/end), `source_page`,
-  `parser_version`) — REQ-RPT-003 traceability. 404 on unknown id.
-- Tests: full shape for a real txn; 404.
-
-### B2. `GET /transactions` — filtered, paginated list (`app/api/transactions.py`)
-- Query: `category`, `merchant` (exact match on `merchant_normalized`), `account_id`,
-  `batch_id`, `date_from`, `date_to` (inclusive, on `transaction_date`), `page` (≥1),
-  `page_size` (1–100, default 50), `sort` (`date_desc` default / `date_asc` / `amount_desc` /
-  `amount_asc`), and `include_duplicates` (default `false`).
-- Default view = the **deduplicated, validated ledger** (same rule as `app/services/ledger.py`
-  — not `DUPLICATE`, statement not `DUPLICATE`/`FAILED`), so a Dashboard drill-through shows
-  exactly the rows behind the number. `include_duplicates=true` widens it to every row
-  (Review's "show me the confirmed duplicates" case).
-- Response `{items, page, page_size, total}`. Each item: `id`, `transaction_date`,
-  `merchant` (`merchant_normalized or description_normalized`), `description_normalized`,
-  `amount_cents`, `direction`, `category`, `category_source`, `bank`,
-  `account_identifier_masked`, `dedup_status`.
-- Reuse the ledger filter helper from `app/services/ledger.py` where practical rather than
-  re-deriving it.
-- Tests: each filter narrows correctly; sort order; pagination; `include_duplicates`; empty →
-  `{items: [], total: 0}`.
-
-### B3. `POST /review/duplicates/{transaction_id}` — the duplicate action (`app/api/review.py`)
-- Body `{action: "keep_both" | "confirm"}`.
-- Preconditions: the txn is currently `POSSIBLE_DUPLICATE`, **or** already in the action's
-  target state (so the call is safe to re-run). Otherwise 409.
-  - `keep_both` → `dedup_status = "UNIQUE"`, `duplicate_of_id = None`.
-  - `confirm` → `dedup_status = "DUPLICATE"` (keeps `duplicate_of_id`); 409 if there is no
-    `duplicate_of_id` to point at.
-- No re-run of dedup or validation; analytics reflects the change on its next read.
-- Returns the txn's new `dedup_status`.
-- Tests: `keep_both` and `confirm` from `POSSIBLE_DUPLICATE`; re-running each is a no-op 200;
-  `confirm` with no match → 409; a `DUPLICATE` txn excluded from `GET /transactions` default
-  but present with `include_duplicates=true`; analytics total drops after `confirm`.
+- [x] `GET /accounts` (`app/api/accounts.py`, new) — paginated, each item: bank, account_type,
+      masked id, statement_count, period_start/end (same rollup-query shape as `GET /batches`).
+- [x] `POST /settings/test-llm-key` (`app/api/settings.py`, new) — body
+      `{provider: "anthropic"|"openai", api_key: str, model?: str}`; 422 unknown provider;
+      `{ok, error}` response, no persistence.
+- [x] `app/workers/processor.py` — delete a terminal job's `pdf_path` unless
+      `APP_RETAIN_RAW_PDFS=1`. `app/workers/queue.py`'s `reclaim_processing_jobs` path is
+      unaffected (a reclaimed job goes to `RETRYING` or `FAILED`; `FAILED` still needs cleanup —
+      route both through the same helper).
+- [x] Tests: `GET /accounts` rollup + pagination + empty; `test-llm-key` ok/error/422; PDF
+      deleted after a terminal job unless retained; not deleted for a job still `RETRYING`.
 
 ## Frontend (`apps/desktop`)
 
-### F0. Primitives
-- Add `@radix-ui/react-dialog` (focus trap + Esc, for the drawer/sheet — design-notes
-  §accessibility). Hand-vendor a minimal `Sheet` (right-side panel + overlay) and a `Select`
-  (category picker) on top of it, or a tiny native `<select>` if that's enough.
-- Extend `lib/api.ts` with the three new calls + query keys; `lib/format.ts` with
-  `formatCents` (already implied) and a `categorySourceLabel`.
-
-### F1. Transaction drawer (`components/TransactionDrawer.tsx`, design-notes §3.6)
-- Opened via a `?txn=<id>` search param (linkable). `GET /transactions/{id}`.
-- Merchant, `-$X · date`, category with `[edit]` → a `Select` of the fixed taxonomy →
-  `PUT /transactions/{id}/category` (per-transaction override), account line, the **Source**
-  block (always shown), raw text.
-- Invalidates `['transactions']` + `['analytics']` on a category change.
-
-### F2. Transaction list sheet (`components/TransactionListSheet.tsx`)
-- A wider sheet holding a compact table, backed by `GET /transactions` with filters from its
-  own props (category / merchant / date window / batch). Page controls. A row opens the F1
-  drawer. This is the "click a number → see the rows" surface (§principle 4).
-
-### F3. Dashboard (`routes/DashboardRoute.tsx`, design-notes §3.1)
-- Date-range control top-right (`Last 12 months` default / `This year` / `All time` / custom)
-  → writes `start` / `end` to the URL; the charts and lists below read them.
-- **Coverage bar**, pinned above everything: from `analytics.coverage`. Green pill when
-  `statements_excluded === 0`; amber + an expandable excluded list otherwise; the bar links to
-  `/history`.
-- **Stat cards**: net cash flow, spending, top category — `tabular` figures.
-  - **Spending card = the latest _full calendar month_** (the current partial month is
-    excluded), with a percentage delta vs the **previous full calendar month**. Label makes
-    that explicit, e.g. "August spending — $4,210  ↓ 3% vs July". Not the selected-range total,
-    not an average.
-  - If there are **fewer than two complete months** of data: show the latest full month with
-    **no delta** and a neutral "Not enough prior data" note.
-  - Clicking the Spending card drills F2 to **exactly that month's spending transactions**
-    (the same `date_from`/`date_to` + spending-category filter that produced the number).
-  - The other cards use the `trends` delta where available. Clicking one opens F2 filtered.
-- **Charts** (Recharts, after the `dataviz` skill): a 12-month cash-flow chart
-  (credits / debits / net, transfers shown distinctly) and a spending-by-category donut. Each
-  has a **"show as table"** toggle rendering the same numbers as an accessible `<table>`.
-  Clicking a category segment opens F2 filtered to that category.
-- **Recurring charges** + **Top merchants** lists (already numeric/tabular; a merchant row
-  opens F2).
-- **AI summary panel** — `GET /analytics/explanation`, its own labelled card with the provider
-  tag + a Refresh button (refetch). `provider === null` → "Add an API key in Settings to get a
-  plain-English summary" empty state. Never blended with the figures (§principle 2).
-- Empty ledger → a "nothing processed yet, import statements" state, not zeroed charts
-  (§empty states).
-
-### F4. Review (`routes/ReviewRoute.tsx`, design-notes §3.4)
-- One page, sections in order, each with a count; the sidebar badge = the sum.
-- **Possible duplicates** — `GET /review/duplicates`; each pair shows both rows; `[Keep both]`
-  → `POST /review/duplicates/{id}` `{keep_both}`, `[This is a duplicate]` → `{confirm}`.
-  Invalidate `['review']` + `['analytics']`.
-- **Needs a category** — `GET /review/categorizations` (grouped by merchant). **The category
-  action must make its scope explicit before writing** (owner correction):
-  - A **merchant-wide** action is presented as explicit intent — the button literally reads
-    "Always categorize <merchant> as <category>" → `PUT /category-rules` (affects every
-    non-overridden transaction of that merchant, now and future).
-  - A generic "Categorize" that silently becomes a rule is **not allowed**. If the user wants
-    to fix only some rows, they expand the group and edit per transaction →
-    `PUT /transactions/{id}/category` (that row only).
-  - Precedence invariant unchanged: `USER OVERRIDE → MERCHANT RULE → prediction ≥ 0.75 →
-    Review`.
-  - Invalidate `['review']` + `['analytics']` + `['transactions']`.
-- **Failed / unsupported statements** — a read-only summary derived from `GET /batches`
-  (batches with `processing_failed > 0`), linking to History for the retry/re-upload. (A
-  first-class `GET /review/statements` endpoint + retry action is a later PR — not in scope
-  here.)
-
-### F5. Tests (Vitest + RTL + MSW)
-- `lib`: the date-range → `start`/`end` helper.
-- `TransactionDrawer`: renders the source block, category edit posts and closes.
-- `TransactionListSheet`: filters passed through to the request; row opens the drawer.
-- `DashboardRoute`: coverage bar green vs amber; AI panel empty state vs text; a chart's
-  "show as table" toggle; empty-ledger state.
-- `ReviewRoute`: `keep_both` / `confirm` hit the right endpoint+body and refetch; a category
-  confirm writes a merchant rule.
-
-### F6. Checks & docs
-- `pnpm lint` / `pnpm typecheck` / `pnpm test:run` / `pnpm build`; backend `uv run pytest` /
-  `ruff`.
-- `docs/activity.md`; `README.md`; `docs/manual-verification-frontend-pr2.md`.
-- `tasks/todo.md` Review.
-
-## Suggested build order
-
-B1 → B2 → B3 (backend, each with tests) → F0 → F1 + F2 (drawer + list, the shared drill-through
-surface) → F3 (Dashboard) → F4 (Review) → F5/F6.
-
-## Owner corrections recorded (2026-09-08)
-
-- **Spending stat card** = latest *full calendar month* vs previous full calendar month;
-  exclude the current partial month; `<2` full months → latest month, no delta, "Not enough
-  prior data"; explicit label; click drills to that month's spending transactions. Not an
-  average, not the range total. (F3.)
-- **Review category action** never silently becomes a merchant rule — the merchant-wide button
-  states the scope explicitly; per-transaction fixes go through `PUT /transactions/{id}/category`.
-  (F4.)
+- [x] `electron/main.ts` — settings file read/write, `safeStorage` encrypt/decrypt, env
+      injection into `startBackend()`, `settings:get`/`settings:save` IPC handlers (save
+      restarts the backend).
+- [x] `electron/preload.ts` — `getSettings()` / `saveSettings(patch)` on `window.desktop`.
+      `useTheme.ts`'s existing outside-Electron fallback pattern extended: outside Electron,
+      `getSettings` returns sensible defaults and `saveSettings` no-ops with a toast explaining
+      settings require the desktop app.
+- [x] `routes/SettingsRoute.tsx` — LLM provider radio + per-provider key input (masked, "••••
+      saved" when one exists, never re-shown) + Test connection button (hits the new backend
+      endpoint directly, no IPC) + Save; retention toggle with the retained-data-usage note
+      (design-notes §3.7); category rules table (`GET`/`PUT`/`DELETE /category-rules`, all
+      already built) editable directly; a License section reserved as a placeholder (per
+      `techstack.md` §19 — not built).
+- [x] `routes/AccountsRoute.tsx` — plain list, `GET /accounts`, period + statement count per row
+      (design-notes §3.5).
+- [x] `router.tsx` — replace both remaining `Placeholder` routes.
+- [x] Tests: `SettingsRoute` (key save flow with `window.desktop` mocked, test-connection
+      success/failure, retention toggle, category rule add/delete); `AccountsRoute` (list +
+      empty state).
+- [x] Docs & checks: `pnpm lint`/`typecheck`/`test:run`/`build`; backend `pytest`/`ruff`;
+      `docs/activity.md`; `README.md`; `docs/manual-verification-frontend-pr3.md`; this file's
+      Review section.
 
 ## Review
 
-**Done:** B1–B3 backend (committed 2026-09-08, `fd3a590`), plus one backend addition this
-session — `GET /transactions?spending_only=true` (`_SPENDING_CATEGORIES`, the same rule
-`analytics.py` uses) so the Spending stat card's drill-through can show exactly the rows behind
-its number, which the existing single-category filter couldn't express. F0–F6 frontend: the
-`Sheet`/`Select` primitives, `TransactionDrawer` (linkable via `?txn=<id>`, mounted once in the
-shell), `TransactionListSheet` (the shared drill-through), `DashboardRoute` (coverage bar, stat
-cards, `CashFlowChart` + `SpendingDonut` with table fallbacks, recurring charges, top merchants,
-AI panel), `ReviewRoute` (three sections, sidebar badge = the sum), and the Sidebar badge wiring.
+**Done:** the approved design end to end — Electron owns `safeStorage`, the backend never
+persists a secret, a save restarts the backend so the new env takes effect. `GET /accounts`
+(read-only, no merge action — see the design note above on why). `POST /settings/test-llm-key`
+routed through a new `llm_gateway.test_provider_key()` rather than importing `app.llm` from the
+API layer, respecting the existing hard architectural boundary
+(`test_only_the_gateway_imports_app_llm`) — caught by that test on the first attempt, fixed
+before it went further. Raw-PDF cleanup (REQ-CLEAN-001) wired into both `process_job()` and
+`reclaim_processing_jobs()`.
 
-**Owner corrections, both honored:** the Spending stat card computes the latest *full* calendar
-month client-side (`lib/dashboard.ts`) rather than trusting the backend's `trends`, which doesn't
-exclude a partial current month; the Review category action's button always names both the
-merchant and the target category explicitly, never a generic "Categorize."
+**Tests:** 17 new backend, 9 new frontend. 262 backend tests, 97.85% coverage, ruff clean; 48
+frontend tests, lint/typecheck/build clean.
 
-**Tests:** 20 new frontend tests + 1 new backend test (`spending_only`). 245 backend tests
-(97.8% coverage, ruff clean), 39 frontend tests, `pnpm lint` / `typecheck` / `build` all clean.
+**Verified against real data and a real provider call:** a fresh backend + standalone Vite dev
+server. Accounts showed the real resolved account and rollup. Settings: an intentionally-wrong
+Anthropic key, tested for real against Anthropic's API, correctly reported the failure without
+ever exposing the key; deleting a real category rule updated the list live. The
+`safeStorage`/restart-on-save/persists-across-app-restart flow needs the real Electron app to
+verify (browser automation can't drive it) — recorded in
+`docs/manual-verification-frontend-pr3.md` for the owner.
 
-**Verified against real data, not just mocks:** ran the actual backend against the real dev DB
-and a standalone Vite dev server (browser-driven, not Electron, so `claude-in-chrome` could
-drive it) — real cash-flow/spending numbers rendered, a merchant drill-through opened the list
-sheet, a row opened the drawer stacked on top, a category edit persisted and the Dashboard's
-Uncategorized total dropped on the next view, and a merchant-wide rule wrote and removed that
-group from Review live. Found and fixed one real environment bug in the process (see below).
+**Known limitation, documented not built:** `techstack.md`'s "estimated-cost note" for LLM usage
+in Settings — no cost-estimation logic exists anywhere in the codebase to surface; out of scope
+for this PR.
 
-**Known issue found and fixed (not a code bug):** a backend process left running from earlier
-manual verification (old code, pre-dating this branch's endpoints) was still bound to port 8420,
-silently serving 404s for every new route. Killed it and started a fresh instance from this
-branch's checkout before re-verifying. Worth remembering: `pnpm dev` / a manually-started
-`uvicorn` can outlive the terminal session that started it — check `netstat -ano | findstr :8420`
-if new endpoints 404 unexpectedly.
-
-**Not built (PR 3, out of scope here):** Accounts, Settings + Electron `safeStorage`,
-`GET /accounts`.
-
-**Recommended next step:** owner review (branch `feature/dashboard-review`, rebased onto
-`fix/stale-processing-jobs`'s merge), then merge to `main`; build-plan #9 PR 3 next.
+**Recommended next step:** owner review — especially the safeStorage/restart flow per the
+manual-verification doc — then merge. This closes out build-plan #9; #10 (Packaging) is next.

@@ -1125,3 +1125,84 @@ every new endpoint — killed it and started a fresh instance from this branch.
 `fix/stale-processing-jobs`'s merge (`dde6293`) after that PR landed.
 
 **Next step:** owner review, then merge; build-plan #9 PR 3 (Accounts + Settings).
+
+## 2026-09-11 — Accounts + Settings (build-plan #9, PR 3 of 3 — closes out #9)
+
+**Investigation before building anything:** LLM keys were env-var only
+(`app/llm/providers.py`), with no settings persistence anywhere. `techstack.md` requires
+`safeStorage` (Electron/Node-only, the Python backend can't decrypt it) for the keys. Raw-PDF
+cleanup didn't exist at all — a real gap against **REQ-CLEAN-001** (`requirements.md` §17.2
+marks retention/cleanup as a security requirement, not optional), since `POST /batches` writes
+every accepted file to `data/tmp/` and nothing ever deleted it.
+
+**Design decision (owner-approved):** settings reach the backend the same way it already gets
+its config — environment variables at spawn. Electron persists LLM keys via
+`safeStorage.encryptString()` in its own `userData/settings.json` (never plaintext, never the
+SQLite DB); `startBackend()` decrypts them and injects `LLM_PROVIDER` / `ANTHROPIC_API_KEY` /
+`ANTHROPIC_MODEL` / `OPENAI_API_KEY` / `OPENAI_MODEL` / `APP_RETAIN_RAW_PDFS` into the spawned
+process's env — the same vars `app/llm/providers.py` already read. **Saving settings restarts
+the backend** (`stopBackend(); startBackend()`) so a changed key takes effect immediately; the
+trade-off (a brief local-only interruption per save) was chosen over adding a new in-memory
+settings store + live-push endpoint to the backend for a screen touched rarely.
+
+### Backend
+
+- `GET /accounts` (`app/api/accounts.py`, new) — paginated, same rollup-query shape as
+  `GET /batches`. Deliberately **read-only**: `Account` identity is
+  `(bank, account_type, masked_digits)` under a DB `UNIQUE` constraint, so the current
+  architecture cannot produce two provisional accounts that are actually the same one —
+  design-notes §3.5's "merge mis-grouped accounts" has no case to handle here, flagged rather
+  than silently built or silently dropped.
+- `POST /settings/test-llm-key` (`app/api/settings.py`, new) — stateless. The actual provider
+  call goes through a new `llm_gateway.test_provider_key()`, **not** a direct `app.llm` import
+  from the API layer — `tests/test_llm_gateway.py::test_only_the_gateway_imports_app_llm` is a
+  hard architectural boundary (only the gateway may import `app.llm`) and caught this on the
+  first attempt. Uses `.categorize()` (cheap, ~120 tokens, no extended thinking) against a fixed
+  throwaway payload, not `.explain()` — only whether it raises `LLMUnavailable` matters.
+- `app/workers/processor.py` / `app/workers/queue.py` — `cleanup_pdf_if_terminal()` deletes a
+  job's raw PDF once it reaches a terminal status (never `RETRYING` — it still needs the file),
+  unless `APP_RETAIN_RAW_PDFS=1`. Wired into both `process_job()` and `reclaim_processing_jobs()`
+  (a reclaim can land straight on `FAILED`, which also needs cleanup).
+- Tests: 17 new (`test_accounts_api.py`, `test_settings_api.py`, `test_llm_gateway.py`'s new
+  `test_provider_key` cases, `test_job_queue.py`'s cleanup cases). Hit one real pytest gotcha:
+  naming a helper function `test_provider_key` and importing its bare name into a test module
+  makes pytest try to collect and run *it* as a test — fixed by referencing it as
+  `llm_gateway.test_provider_key(...)` instead of importing the name directly.
+
+### Frontend (`apps/desktop`)
+
+- `electron/settings.ts` (new) — the `safeStorage` read/write/encrypt/decrypt layer;
+  `electron/main.ts` injects its output into `startBackend()`'s env and exposes
+  `settings:get`/`settings:save` IPC (save restarts the backend); `electron/preload.ts` exposes
+  `getSettings()`/`saveSettings()` on `window.desktop`, returning only booleans
+  (`hasAnthropicKey`/`hasOpenaiKey`) — never a decrypted key or its ciphertext — to the renderer.
+- `routes/SettingsRoute.tsx` — provider radio, per-provider masked key input + Test connection
+  (hits the backend directly, no IPC) + model override, retention toggle, category-rule table
+  (`GET`/`PUT`/`DELETE /category-rules`, already built), a reserved License section. Outside
+  Electron (plain `vite`), `saveSettings` throws a caught, toasted error rather than silently
+  no-opping — matches `useTheme.ts`'s existing outside-Electron fallback pattern.
+- `routes/AccountsRoute.tsx` — plain paginated list.
+- `Placeholder.tsx` deleted — both routes it backed are now real screens.
+- Tests: 9 new (`AccountsRoute.test.tsx`, `SettingsRoute.test.tsx` — key save flow and test
+  connection against a mocked `window.desktop`, retention toggle, category rule add/remove).
+  48 frontend tests total; `pnpm lint`/`typecheck`/`build` clean.
+
+**Verified against the real dev DB and a real provider call**, not just mocks: a fresh backend
+(port 8421, to dodge an unrelated stale process still answering on 8420) + a standalone Vite dev
+server. Accounts listed the real Santander account with its real statement count/period.
+Settings: typing an intentionally-wrong Anthropic key and clicking Test connection made a real
+call to Anthropic's API and correctly reported `anthropic: HTTPStatusError`, masked the key the
+whole time, and never echoed it. Clicking Save outside Electron correctly toasted "Settings
+require the desktop app" instead of silently failing. Deleting a real category rule
+(`Check → Credit Card Payments`) removed it live and the table correctly showed the next real
+rule underneath.
+
+**Not independently verified this session** (needs the real Electron app, which browser
+automation can't drive): the actual `safeStorage` encrypt/decrypt round-trip, the
+backend-restart-on-save, and that a saved key survives an app restart. Recorded in
+`docs/manual-verification-frontend-pr3.md` for the owner to confirm in the real app.
+
+**Repo note:** branch `feature/accounts-settings` off `main` (PR #17 merged).
+
+**Next step:** owner review — specifically the safeStorage/restart flow in the real app, per the
+manual-verification doc — then merge. This closes out build-plan #9; #10 (packaging) is next.

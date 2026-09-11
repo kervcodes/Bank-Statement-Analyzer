@@ -241,6 +241,61 @@ def test_explain_falls_back_on_provider_failure(monkeypatch: pytest.MonkeyPatch)
     assert out.text == "Here is the summary."
 
 
+# --- test_provider_key (REQ-SET-001) -----------------------------------
+
+
+class _FakeProvider:
+    def __init__(self, api_key: str, model: str, outcome=None):
+        self.api_key = api_key
+        self.model = model
+        self._outcome = outcome
+
+    def categorize(self, _payload):
+        if isinstance(self._outcome, Exception):
+            raise self._outcome
+        return self._outcome
+
+
+def test_provider_key_returns_none_on_success(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        llm_gateway,
+        "AnthropicProvider",
+        lambda api_key, model: _FakeProvider(api_key, model),
+    )
+
+    assert llm_gateway.test_provider_key("anthropic", "sk-ant-fake") is None
+
+
+def test_provider_key_returns_the_error_on_failure(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        llm_gateway,
+        "OpenAIProvider",
+        lambda api_key, model: _FakeProvider(
+            api_key, model, outcome=LLMUnavailable("openai: HTTPStatusError")
+        ),
+    )
+
+    assert (
+        llm_gateway.test_provider_key("openai", "sk-bad") == "openai: HTTPStatusError"
+    )
+
+
+def test_provider_key_uses_the_default_model_when_none_given(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured = {}
+
+    def _fake(api_key, model):
+        captured["model"] = model
+        return _FakeProvider(api_key, model)
+
+    monkeypatch.setattr(llm_gateway, "AnthropicProvider", _fake)
+
+    llm_gateway.test_provider_key("anthropic", "sk-ant-fake")
+
+    assert captured["model"] == "claude-sonnet-5"
+
+
 # --- import boundary --------------------------------------------------
 
 

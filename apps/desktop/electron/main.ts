@@ -2,6 +2,12 @@ import { app, BrowserWindow, ipcMain, nativeTheme } from 'electron'
 import { spawn, type ChildProcess } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import {
+  backendEnv,
+  getPublicSettings,
+  saveSettings,
+  type SettingsPatch,
+} from './settings'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -16,7 +22,12 @@ function startBackend() {
   backendProcess = spawn(
     'uv',
     ['run', 'uvicorn', 'app.main:app', '--port', '8420', '--reload'],
-    { cwd: BACKEND_DIR, shell: true, stdio: 'pipe' },
+    {
+      cwd: BACKEND_DIR,
+      shell: true,
+      stdio: 'pipe',
+      env: { ...process.env, ...backendEnv() },
+    },
   )
   backendProcess.stdout?.on('data', (data) => process.stdout.write(data))
   backendProcess.stderr?.on('data', (data) => process.stderr.write(data))
@@ -52,6 +63,19 @@ ipcMain.on('theme:get', (event) => {
 
 nativeTheme.on('updated', () => {
   win?.webContents.send('theme:changed', nativeTheme.shouldUseDarkColors)
+})
+
+ipcMain.handle('settings:get', () => getPublicSettings())
+
+ipcMain.handle('settings:save', (_event, patch: SettingsPatch) => {
+  const result = saveSettings(patch)
+  // The backend only reads its config at spawn -- restart it so a changed key
+  // or the retention toggle takes effect immediately (owner-approved
+  // trade-off: a brief local-only interruption instead of new backend
+  // persistence/IPC surface).
+  stopBackend()
+  startBackend()
+  return result
 })
 
 app.whenReady().then(() => {
