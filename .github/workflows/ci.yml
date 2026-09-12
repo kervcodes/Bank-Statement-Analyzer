@@ -33,7 +33,14 @@ jobs:
         run: uv run ruff format --check .
 
       - name: Test (coverage gate enforced via pyproject.toml, currently 90%)
-        run: uv run pytest
+        run: uv run pytest --junitxml=test-results.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-results
+          path: apps/backend/test-results.xml
 
   frontend:
     runs-on: ubuntu-latest
@@ -66,4 +73,85 @@ jobs:
         run: pnpm typecheck
 
       - name: Test
-        run: pnpm test:run
+        run: pnpm exec vitest run --reporter=default --reporter=json --outputFile=vitest-results.json
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-test-results
+          path: apps/desktop/vitest-results.json
+
+  # Reads the two jobs' test results and commits updated pass/fail-count
+  # badge JSON back to main, read by the README's shields.io endpoint
+  # badges. Runs after both jobs regardless of outcome (a red badge is the
+  # point) but only on push to main -- never on PRs, which can't push.
+  # Pushing with the default GITHUB_TOKEN doesn't retrigger this workflow,
+  # so there's no infinite-loop risk (github.com/actions, "events that
+  # trigger workflows" -- token-authored pushes are excluded).
+  update-badges:
+    needs: [backend, frontend]
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: backend-test-results
+          path: badge-input
+        continue-on-error: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-test-results
+          path: badge-input
+        continue-on-error: true
+
+      - name: Build badge JSON from test results
+        run: |
+          mkdir -p .github/badges
+          python3 - <<'PY'
+          import json
+          import os
+          import xml.etree.ElementTree as ET
+
+          def badge(label, message, ok):
+              return {
+                  "schemaVersion": 1,
+                  "label": label,
+                  "message": message,
+                  "color": "brightgreen" if ok else "red",
+              }
+
+          xml_path = "badge-input/test-results.xml"
+          if os.path.exists(xml_path):
+              suite = ET.parse(xml_path).getroot()
+              if suite.tag != "testsuite":
+                  suite = suite.find("testsuite")
+              failed = int(suite.get("failures", 0)) + int(suite.get("errors", 0))
+              passed = int(suite.get("tests", 0)) - failed - int(suite.get("skipped", 0))
+              data = badge("backend tests", f"{passed} passed, {failed} failed", failed == 0)
+          else:
+              data = badge("backend tests", "no results", False)
+          json.dump(data, open(".github/badges/backend-tests.json", "w"))
+
+          json_path = "badge-input/vitest-results.json"
+          if os.path.exists(json_path):
+              r = json.load(open(json_path))
+              passed, failed = r["numPassedTests"], r["numFailedTests"]
+              data = badge("frontend tests", f"{passed} passed, {failed} failed", failed == 0)
+          else:
+              data = badge("frontend tests", "no results", False)
+          json.dump(data, open(".github/badges/frontend-tests.json", "w"))
+          PY
+
+      - name: Commit badge updates
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/badges/backend-tests.json .github/badges/frontend-tests.json
+          git diff --cached --quiet || git commit -m "chore: update test-count badges [skip ci]"
+          git push
