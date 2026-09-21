@@ -24,10 +24,20 @@ _PREFIXES = re.compile(
     r"ELECTRONIC\s+(?:WITHDRAWAL|DEPOSIT)\s+|"
     r"EXTERNAL\s+(?:WITHDRAWAL|DEPOSIT)\s+|"
     r"(?:PAYROLL\s+)?DIRECT\s+DEP(?:OSIT)?\s+|"
-    r"PAYROLL\s+DEP(?:OSIT)?\s+"
+    r"PAYROLL\s+DEP(?:OSIT)?\s+|"
+    r"MOBILE\s*-\s*"
     r")",
     re.IGNORECASE,
 )
+
+# A store-number marker (e.g. "#2284") anywhere in the text. Applied before
+# `_SUFFIXES` so a trailing branch/city name after the number (e.g. "WENDY'S
+# #2284 STOUGHTON") doesn't block `_SUFFIXES`'s end-anchored match -- without
+# this, "STOUGHTON" is neither a recognized suffix token nor absent, so the
+# whole anchored group fails and *nothing* gets stripped. Cuts off everything
+# from the first store-number marker onward; `_SUFFIXES` then removes the
+# marker itself as before.
+_STORE_NUMBER = re.compile(r"\s+(?:STORE\s*#?\d+|#\s*\d+)", re.IGNORECASE)
 
 # Trailing noise: channel words, a state tag, ref/auth/store numbers, dates.
 _SUFFIXES = re.compile(
@@ -90,6 +100,9 @@ def normalize_merchant(description: str) -> str:
     text = _PREFIXES.sub("", text).strip()
     # split a processor-glued token like "AMAZON.COM*A1B2" on the '*'
     text = text.split("*", 1)[0].strip()
+    store_number = _STORE_NUMBER.search(text)
+    if store_number:
+        text = text[: store_number.end()]
     text = _SUFFIXES.sub("", text).strip()
     text = _WS.sub(" ", text)
 

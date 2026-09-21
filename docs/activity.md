@@ -1206,3 +1206,116 @@ backend-restart-on-save, and that a saved key survives an app restart. Recorded 
 
 **Next step:** owner review — specifically the safeStorage/restart flow in the real app, per the
 manual-verification doc — then merge. This closes out build-plan #9; #10 (packaging) is next.
+
+## 2026-09-20 — Reduce Uncategorized coverage (off-plan, requested by owner)
+
+**Prompt:** the owner reported the dashboard had far too many legitimate transactions (Wendy's,
+Aldi, BJ's, 7-Eleven, OpenAI, GitHub, Cursor AI, and others) ending up Uncategorized, and asked
+for an end-to-end investigation before any code changed — no lowering `AUTO_ASSIGN_THRESHOLD`, no
+categorizing every debit as Shopping, no hundreds of personal merchant names.
+
+**Diagnosis (full investigation in `tasks/todo.md`, read against the real `app.db`):**
+- **Zero `predicted_source = "LLM"` rows existed anywhere in 2,516 real transactions.** The LLM
+  fallback had never once produced a prediction. Root cause: `categorize_statement()` (the only
+  function that runs the LLM phase) is called exactly once, at ingestion
+  (`workers/processor.py`). `recategorize_transaction()` — the function every existing mutation
+  path uses — only re-resolves from an already-stored prediction; it never re-predicts. A
+  transaction imported before a rule existed, before merchant normalization was fixed, or before
+  an LLM key was configured stayed exactly as it was, forever. This was the single biggest lever,
+  independent of every other fix.
+- Missing deterministic coverage for common chains (Wendy's, Burger King, Aldi, BJ's, 7-Eleven,
+  Home Depot, Nordstrom, Advance Auto Parts) and missing toll/generic-fee keywords.
+- Merchant normalization bugs that **fragmented one real merchant into multiple canonical
+  strings** — a trailing city/branch name after a store number (`"WENDY'S #2284 STOUGHTON"`)
+  broke `_SUFFIXES`'s end-anchored regex entirely (neither the store number nor the city was
+  stripped), and an unhandled bank-specific `"MOBILE - "` channel prefix ate into the 3-token
+  fallback budget, truncating real merchant names.
+- Ruled out: the Privacy Gateway (read in full — an ordinary local business name never trips its
+  residual-PII patterns) and the 0.75 threshold (moot with zero LLM predictions to gate).
+- **245 transactions had `merchant_normalized IS NULL`** — traced to two statements imported
+  2026-09-09 (the oldest in the dataset, both jobs `COMPLETED`, both with a suspicious
+  whole-second `created_at` unlike every other statement's microsecond-precision timestamp) that
+  never went through `categorize_statement` at all. Not an active/recurring bug — the worker is
+  strictly single-threaded and sequential, so no race is possible — a historical data gap that
+  the new backfill resolves regardless of its exact origin.
+
+**Design correction mid-plan:** the owner caught a real flaw in the first draft — a flat
+`BJ's -> Groceries` rule and blind `"MOBILE - "` stripping, based on real evidence that the same
+merchant is Fuel or Groceries depending on transaction subtype (`"BJ's Fuel"` / a `"MOBILE - "`
+card-present channel at the pump vs. `"BJ's Wholesale"` in-store). Fixed by adding a new
+**merchant-contextual rule tier**, checked before a merchant's own flat default, that matches a
+subtype pattern against `description_normalized` (never the collapsed `merchant_normalized` —
+identity and category are different questions). Also caught a **pre-existing correctness bug**
+while reviewing the other flagged merchants this way: Costco had no fuel case at all, so any
+Costco gas purchase already in the data was silently mis-categorized as Groceries.
+
+**Backend changes:**
+- `services/categorization_rules.py` — new aliases (Aldi, BJ's Wholesale Club, Wendy's, Burger
+  King, 7-Eleven, Home Depot, Nordstrom, Advance Auto Parts, Burlington, Dollar Tree/General,
+  no-hyphen TMOBILE), new merchant defaults, new `MERCHANT_CONTEXTUAL_RULES` dict (BJ's/Costco/
+  7-Eleven fuel-vs-default), new keywords (`TOLL`/`EZPASS`/`E-ZPASS`, `CRCARDPMT`, a
+  last-resort generic `FEE` placed after every specific fee phrase and after `PARKING` so neither
+  is shadowed).
+- `services/categorization.py` — `predict_category` checks the contextual tier before a
+  merchant's flat default. Extracted `_predict_and_resolve()` from `categorize_statement`'s body
+  and added `recategorize_pending(session)`: an explicit backfill that re-normalizes and
+  re-predicts every transaction with no `user_category`, sharing the same pipeline body so there
+  is one prediction path, not two. Never touches a `USER`-set row; an active merchant rule still
+  wins in `resolve_category` regardless of the fresh prediction.
+- `services/merchant_normalization.py` — added a `MOBILE\s*-\s*` prefix strip, and a
+  `_STORE_NUMBER` pre-truncation step applied before `_SUFFIXES` so a trailing city/branch name
+  after a store number no longer blocks stripping either token.
+- `api/categorization.py` (new) — `POST /categorization/recategorize`, an explicit,
+  user-triggered action (not automatic on settings save — a real LLM backfill has real
+  latency/cost), returning `transactions_considered` / `uncategorized_before` /
+  `uncategorized_after`.
+- `services/llm_gateway.py` — added `has_configured_provider()` so `review.py` can check whether
+  a provider is configured without importing `app.llm` directly (would have broken
+  `test_only_the_gateway_imports_app_llm`, the hard architectural boundary — caught before it
+  went further, same class of mistake build-plan #9 PR 3 hit with `app/api/settings.py`).
+- `api/review.py` — `/review/categorizations` now returns a coarse `skip_reason`
+  (`low_confidence` / `no_provider_configured` / `no_usable_llm_answer`) per group, computed
+  entirely from existing fields plus the one new boolean check — no schema change, no PII, no
+  provider details.
+
+**Tests:** 33 new (contextual-rule precedence and non-interference, the new deterministic
+rules/keywords, `merchant_normalization`'s prefix/store-number/city fixes, `recategorize_pending`
+— idempotent, never touches a `USER` row, honors an active merchant rule, picks up a newly-added
+contextual rule retroactively — the new `/categorization/recategorize` endpoint, and a new
+`tests/fixtures/categorization_eval.py` + `test_categorization_eval.py` that reports real
+coverage/accuracy numbers (deterministic/LLM/auto-assigned/Review rates, incorrect-assignment
+count) against a stubbed LLM rather than just asserting pass/fail. Full suite: 292 passed, 97.85%
+coverage, `ruff check`/`ruff format --check` clean.
+
+**Measured against a scratch copy of the real `app.db`** (never the live file) — not a synthetic
+claim: `recategorize_pending()` alone, **with no LLM key configured at all**, took real
+Uncategorized from 1,371/2,516 (54.5%) to 907/2,516 (36.0%) — 464 fewer Uncategorized
+transactions, purely from the merchant-normalization fixes, the new deterministic rules, and the
+contextual tier. The true improvement once a real LLM key is configured (for the genuine
+long-tail: Cursor AI, OpenAI, GitHub, Life360, Princh.com, Village Speech, etc.) will be larger
+still. Scratch copy deleted after measurement.
+
+**Repo note:** branch `feature/categorization-coverage` off `origin/main` (`0483a48` +
+README PR #19). Not yet merged.
+
+**Open, deferred to a follow-up (flagged in `tasks/todo.md`, owner has not been asked to decide
+yet):** a *user-defined* contextual rule (e.g. "BJ's + Fuel -> X", not just "BJ's -> X") would
+need a `CategoryRule` schema change and new API surface — the built-in contextual tier already
+resolves every concrete case raised so far, so this was intentionally not built in this change.
+Also unconfirmed without real descriptor samples: whether CVS/Walgreens front-store-vs-pharmacy
+is actually distinguishable from the text (left as a single default, documented as a known
+limitation rather than guessed at).
+
+**Follow-up same day: wired the backfill to the frontend.** Owner asked for it to be
+user-triggerable, not just an API endpoint.
+- `lib/api.ts` — `SkipReason` type, `skip_reason` added to `UncategorizedGroup`, new
+  `RecategorizeResponse` type, `api.recategorize()` (bare `POST /categorization/recategorize`,
+  no body).
+- `routes/ReviewRoute.tsx` — a "Recheck Uncategorized" button in the categorization section header
+  that calls it and refetches Review + analytics + transactions on completion (same
+  invalidation as an applied merchant rule); reports "Resolved N of M" or "No change" inline. A
+  group with no `suggested_category` now shows a plain-English reason
+  (`SKIP_REASON_LABEL`) instead of nothing.
+- Tests: 2 new (`ReviewRoute.test.tsx`) — the skip-reason text renders for a merchant with no
+  suggestion, and the button posts to the endpoint and reflects the before/after counts. 50
+  frontend tests total; `pnpm lint`/`typecheck`/`test:run`/`build` all clean.

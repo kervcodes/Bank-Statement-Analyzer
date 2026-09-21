@@ -108,6 +108,7 @@ describe('ReviewRoute', () => {
               total_cents: 8400,
               suggested_category: 'Home Services',
               sample_description: 'XYZ SERVICES ACH',
+              skip_reason: 'low_confidence',
             },
           ],
         },
@@ -137,6 +138,66 @@ describe('ReviewRoute', () => {
         category: 'Home Services',
       }),
     )
+  })
+
+  it('shows why a merchant with no suggestion is still Uncategorized', async () => {
+    server.use(
+      ...baseHandlers({
+        categorizations: {
+          groups: [
+            {
+              merchant: 'ZZQ VENDOR',
+              transaction_count: 2,
+              total_cents: 4000,
+              suggested_category: null,
+              sample_description: 'ZZQ VENDOR',
+              skip_reason: 'no_provider_configured',
+            },
+          ],
+        },
+      }),
+    )
+    renderRoute(<ReviewRoute />)
+    await screen.findByText('Needs a category (1)')
+
+    expect(
+      screen.getByText('No LLM provider is configured (see Settings) to suggest one.'),
+    ).toBeInTheDocument()
+  })
+
+  it('Recheck Uncategorized posts to the backfill endpoint and refetches', async () => {
+    let recategorizeCalls = 0
+    server.use(
+      ...baseHandlers({
+        categorizations: {
+          groups: [
+            {
+              merchant: 'ALDI',
+              transaction_count: 1,
+              total_cents: 2500,
+              suggested_category: null,
+              sample_description: 'ALDI 123 CAMBRIDGE',
+              skip_reason: 'no_provider_configured',
+            },
+          ],
+        },
+      }),
+      http.post(`${API_BASE}/categorization/recategorize`, () => {
+        recategorizeCalls += 1
+        return HttpResponse.json({
+          transactions_considered: 5,
+          uncategorized_before: 3,
+          uncategorized_after: 1,
+        })
+      }),
+    )
+    renderRoute(<ReviewRoute />)
+    await screen.findByText('Needs a category (1)')
+
+    await userEvent.click(screen.getByRole('button', { name: 'Recheck Uncategorized' }))
+
+    await waitFor(() => expect(recategorizeCalls).toBe(1))
+    expect(await screen.findByText('Resolved 2 of 3.')).toBeInTheDocument()
   })
 
   it('a failed batch links to History', async () => {

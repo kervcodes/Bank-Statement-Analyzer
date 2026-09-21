@@ -11,6 +11,7 @@ import {
   type BatchListItem,
   type DuplicateAction,
   type PossibleDuplicate,
+  type RecategorizeResponse,
   type ReviewTransaction,
   type UncategorizedGroup,
 } from '../lib/api'
@@ -143,6 +144,12 @@ function DuplicatesSection({
   )
 }
 
+const SKIP_REASON_LABEL: Record<UncategorizedGroup['skip_reason'], string> = {
+  low_confidence: 'The automated guess was below the confidence bar for auto-assign.',
+  no_provider_configured: 'No LLM provider is configured (see Settings) to suggest one.',
+  no_usable_llm_answer: "The LLM couldn't produce a usable answer for this merchant.",
+}
+
 function CategorizationSection({
   groups,
   onResolved,
@@ -153,6 +160,10 @@ function CategorizationSection({
   const [expanded, setExpanded] = useState<string | null>(null)
   const [choice, setChoice] = useState<Record<string, string>>({})
   const [pending, setPending] = useState<string | null>(null)
+  const [recheck, setRecheck] = useState<{
+    status: 'idle' | 'running' | 'error'
+    result?: RecategorizeResponse
+  }>({ status: 'idle' })
 
   const applyRule = async (merchant: string, category: string) => {
     setPending(merchant)
@@ -164,9 +175,44 @@ function CategorizationSection({
     }
   }
 
+  const recheckUncategorized = async () => {
+    setRecheck({ status: 'running' })
+    try {
+      const result = await api.recategorize()
+      setRecheck({ status: 'idle', result })
+      onResolved()
+    } catch {
+      setRecheck({ status: 'error' })
+    }
+  }
+
   return (
     <Card>
-      <h2 className="mb-3 text-sm font-semibold">Needs a category ({groups.length})</h2>
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-sm font-semibold">Needs a category ({groups.length})</h2>
+        <div className="flex items-center gap-2">
+          {recheck.result && (
+            <span className="text-xs text-slate-500">
+              {recheck.result.uncategorized_before - recheck.result.uncategorized_after > 0
+                ? `Resolved ${
+                    recheck.result.uncategorized_before - recheck.result.uncategorized_after
+                  } of ${recheck.result.uncategorized_before}.`
+                : 'No change — nothing new to resolve.'}
+            </span>
+          )}
+          {recheck.status === 'error' && (
+            <span className="text-xs text-rose-600">Couldn't recheck. Try again.</span>
+          )}
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={recheck.status === 'running'}
+            onClick={recheckUncategorized}
+          >
+            {recheck.status === 'running' ? 'Rechecking…' : 'Recheck Uncategorized'}
+          </Button>
+        </div>
+      </div>
       {groups.length === 0 ? (
         <p className="text-sm text-slate-500">Nothing to review.</p>
       ) : (
@@ -190,9 +236,13 @@ function CategorizationSection({
                     {g.transaction_count === 1 ? '' : 's'}
                   </span>
                 </button>
-                {g.suggested_category && (
+                {g.suggested_category ? (
                   <p className="ml-5 text-xs text-slate-500">
                     Suggested: {g.suggested_category}
+                  </p>
+                ) : (
+                  <p className="ml-5 text-xs text-slate-400">
+                    {SKIP_REASON_LABEL[g.skip_reason]}
                   </p>
                 )}
                 <div className="ml-5 mt-1.5 flex flex-wrap items-center gap-2">

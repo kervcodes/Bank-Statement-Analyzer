@@ -18,6 +18,7 @@ from sqlmodel import Session, col, select
 
 from app.db import get_db_session
 from app.models import Statement, Transaction
+from app.services.llm_gateway import has_configured_provider
 
 router = APIRouter(prefix="/review", tags=["review"])
 
@@ -140,6 +141,25 @@ def resolve_possible_duplicate(
     return DuplicateActionResponse(id=txn.id, dedup_status=txn.dedup_status)
 
 
+SkipReason = Literal["low_confidence", "no_provider_configured", "no_usable_llm_answer"]
+
+
+def _skip_reason(txn: Transaction, *, provider_configured: bool) -> SkipReason:
+    """Why this transaction is still Uncategorized -- coarse on purpose. Never
+    a provider name, an error class, or any payload content, just which of a
+    few broad situations applies (REQ-LLM-002)."""
+    if txn.predicted_category is not None:
+        # A rule or the LLM answered; it just didn't clear the auto-assign gate.
+        return "low_confidence"
+    if not provider_configured:
+        return "no_provider_configured"
+    # A provider is configured but produced nothing usable for this merchant --
+    # the privacy gateway blocked the payload, every provider was unavailable,
+    # or the reply couldn't be parsed. Not distinguished further without a new
+    # persisted field, which isn't worth it for a Review-screen hint.
+    return "no_usable_llm_answer"
+
+
 class UncategorizedGroup(BaseModel):
     merchant: str
     transaction_count: int
@@ -147,6 +167,7 @@ class UncategorizedGroup(BaseModel):
     # the sub-threshold guess, if there was one — shown as "Suggested: X"
     suggested_category: str | None
     sample_description: str
+    skip_reason: SkipReason
 
 
 class UncategorizedResponse(BaseModel):
@@ -165,6 +186,7 @@ def get_uncategorized(
         .order_by(col(Transaction.merchant_normalized), col(Transaction.id))
     ).all()
 
+    provider_configured = has_configured_provider()
     grouped: dict[str, list[Transaction]] = defaultdict(list)
     for txn in rows:
         grouped[txn.merchant_normalized or txn.description_normalized].append(txn)
@@ -178,6 +200,7 @@ def get_uncategorized(
                 (t.predicted_category for t in txns if t.predicted_category), None
             ),
             sample_description=txns[0].description_normalized,
+            skip_reason=_skip_reason(txns[0], provider_configured=provider_configured),
         )
         for merchant, txns in grouped.items()
     ]

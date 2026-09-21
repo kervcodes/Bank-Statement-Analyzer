@@ -58,6 +58,14 @@ def _chain() -> list[LLMProvider]:
     return configured_providers() or [NullProvider()]
 
 
+def has_configured_provider() -> bool:
+    """Whether an LLM provider is configured at all -- for observability only
+    (e.g. explaining an Uncategorized transaction in the Review UI as "no
+    provider" vs. "the provider ran and didn't produce a usable answer").
+    Never a provider name or key, just a boolean."""
+    return bool(configured_providers())
+
+
 def suggest_category(
     *,
     merchant_normalized: str | None,
