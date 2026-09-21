@@ -28,6 +28,26 @@ from app.services.merchant_normalization import normalize_merchant
         ("DIRECT DEP GOOGLE LLC", "Google Llc"),
         # unknown merchant: cleaned but still recognizable, never empty
         ("ELECTRIC COMPANY AUTO PYMT 260317", "Electric Company"),
+        # a store number followed by a city/branch name doesn't block
+        # stripping either token -- two locations of the same chain collapse
+        # to one canonical merchant.
+        ("WENDY'S #2284 STOUGHTON", "Wendy's"),
+        ("WENDY'S #4471 FOXBORO", "Wendy's"),
+        ("BURGER KING #23973", "Burger King"),
+        ("ADVANCE AUTO PARTS #456", "Advance Auto Parts"),
+        # a bank-specific "MOBILE - " channel prefix is noise for merchant
+        # identity and must not eat into the fallback's 3-token budget.
+        ("MOBILE - BLACK SEED HALAL", "Black Seed Halal"),
+        ("MOBILE - 7-ELEVEN", "7-Eleven"),
+        # BJ's collapses to one canonical identity regardless of channel
+        # prefix, apostrophe, or department -- categorization tells fuel and
+        # groceries apart from `description_normalized`, not from this value.
+        ("MOBILE - BJS", "BJ's Wholesale Club"),
+        ("BJ'S FUEL #9101", "BJ's Wholesale Club"),
+        ("BJS WHOLESALE #123", "BJ's Wholesale Club"),
+        # a no-hyphen carrier descriptor still resolves to the same merchant
+        # as the hyphenated one.
+        ("TMOBILE AU BELLEVUE", "T-Mobile"),
     ],
 )
 def test_normalize_merchant(description: str, expected: str):

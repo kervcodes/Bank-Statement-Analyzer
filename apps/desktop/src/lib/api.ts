@@ -242,16 +242,25 @@ export interface DuplicateActionResponse {
   dedup_status: string
 }
 
+export type SkipReason = 'low_confidence' | 'no_provider_configured' | 'no_usable_llm_answer'
+
 export interface UncategorizedGroup {
   merchant: string
   transaction_count: number
   total_cents: number
   suggested_category: string | null
   sample_description: string
+  skip_reason: SkipReason
 }
 
 export interface UncategorizedResponse {
   groups: UncategorizedGroup[]
+}
+
+export interface RecategorizeResponse {
+  transactions_considered: number
+  uncategorized_before: number
+  uncategorized_after: number
 }
 
 export interface RuleWriteResponse {
@@ -428,6 +437,11 @@ export const api = {
     }),
 
   getUncategorized: () => request<UncategorizedResponse>('/review/categorizations'),
+
+  recategorize: () =>
+    request<RecategorizeResponse>('/categorization/recategorize', {
+      method: 'POST',
+    }),
 
   listCategoryRules: () => request<CategoryRuleOut[]>('/category-rules'),
 

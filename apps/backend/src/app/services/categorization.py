@@ -1,18 +1,29 @@
 """REQ-CAT-001/003: assign each transaction a category through a fixed hierarchy.
 
-```
-USER OVERRIDE  →  MERCHANT RULE  →  DETERMINISTIC RULES  →  LLM (build-plan #8 pt 2)
-      →  confidence ≥ AUTO_ASSIGN_THRESHOLD ?  assign  :  Uncategorized (Review)
+```text
+USER OVERRIDE  ->  MERCHANT RULE  ->  MERCHANT-CONTEXTUAL RULE  ->  MERCHANT DEFAULT
+      ->  GENERIC KEYWORD RULE  ->  LLM (build-plan #8 pt 2)
+      ->  confidence >= AUTO_ASSIGN_THRESHOLD ?  assign  :  Uncategorized (Review)
 ```
 
 The prediction (`predicted_*`) is stored separately from the effective `category`
 and is never discarded, so removing a user override or a merchant rule restores
 it with no bulk row rewrite (REQ-CAT-004).
 
-`predict_category` is deterministic-only. The LLM step runs in
+`predict_category` is deterministic-only, and checks a merchant's own
+contextual pattern (`MERCHANT_CONTEXTUAL_RULES`) before that same merchant's
+flat default -- a warehouse club sells both groceries and gas, and a single
+`merchant -> category` mapping cannot express that. The LLM step runs in
 `categorize_statement` as a separate phase over the transactions the rules left
 `NONE` -- one call per unique merchant, always through `llm_gateway` (never a
 provider client directly), and still subject to the 0.75 gate.
+
+`categorize_statement` runs once, at ingestion, and `recategorize_pending` (an
+explicit later backfill over every transaction not fixed by a user override)
+share the same `_predict_and_resolve` body, so there is one prediction
+pipeline, not two that can drift apart. `recategorize_transaction` is
+deliberately different: it only re-resolves from the already-stored
+prediction (a user edit or a merchant-rule change doesn't need a fresh guess).
 """
 
 from collections import defaultdict
@@ -27,6 +38,7 @@ from app.services.categorization_rules import (
     CONFIDENCE_MERCHANT,
     KEYWORD_CATEGORY,
     MERCHANT_CATEGORY,
+    MERCHANT_CONTEXTUAL_RULES,
 )
 from app.services.llm_gateway import suggest_category
 from app.services.merchant_normalization import normalize_merchant
@@ -51,9 +63,25 @@ NO_PREDICTION = Prediction(category=None, confidence=0.0, source="NONE")
 def predict_category(
     merchant: str, description_normalized: str, direction: str
 ) -> Prediction:
-    """The deterministic automated guess for one transaction — exact merchant
-    mapping, then keyword rules, then a direction-based default for credits.
-    No network; the LLM step is a separate phase in `categorize_statement`."""
+    """The deterministic automated guess for one transaction — a merchant's own
+    contextual pattern (if any) beats that same merchant's default category,
+    which beats keyword rules, which beat a direction-based default for
+    credits. No network; the LLM step is a separate phase in
+    `categorize_statement`.
+
+    Contextual matching always reads `description_normalized`, never
+    `merchant_normalized` -- the merchant name is intentionally collapsed for
+    display/identity (e.g. "BJ's Wholesale Club" for every BJ's charge), so it
+    is the wrong place to look for a subtype signal like "FUEL" that the
+    original description still carries.
+    """
+    contextual_rules = MERCHANT_CONTEXTUAL_RULES.get(merchant)
+    if contextual_rules is not None:
+        description_haystack = description_normalized.upper()
+        for keyword, category in contextual_rules:
+            if keyword in description_haystack:
+                return Prediction(category, CONFIDENCE_MERCHANT, "RULE")
+
     exact = MERCHANT_CATEGORY.get(merchant)
     if exact is not None:
         return Prediction(exact, CONFIDENCE_MERCHANT, "RULE")
@@ -129,16 +157,14 @@ def _llm_fill(txns: list[Transaction]) -> None:
             txn.predicted_source = "LLM"
 
 
-def categorize_statement(session: Session, statement: Statement) -> None:
-    """The pipeline pass: normalize the merchant, predict (rules then LLM), and
-    resolve for every transaction on the statement. Idempotent; leaves a
-    `USER`-set transaction's prediction untouched."""
-    rules = _rule_lookup(session)
-    txns = list(
-        session.exec(
-            select(Transaction).where(col(Transaction.statement_id) == statement.id)
-        )
-    )
+def _predict_and_resolve(
+    session: Session, txns: list[Transaction], rules: dict[str, str]
+) -> None:
+    """The shared per-transaction-set pipeline body: normalize, predict (rules
+    then LLM), then resolve. Used both for a freshly-ingested statement and for
+    an arbitrary later re-run (`recategorize_pending`) -- one prediction
+    pipeline, not two. Leaves a `USER`-set transaction's prediction untouched;
+    does not commit (the caller owns the transaction boundary)."""
     for txn in txns:
         txn.merchant_normalized = normalize_merchant(txn.description_normalized)
         if txn.user_category is None:
@@ -154,7 +180,44 @@ def categorize_statement(session: Session, statement: Statement) -> None:
     for txn in txns:
         resolve_category(txn, merchant_rule_category=rules.get(txn.merchant_normalized))
         session.add(txn)
+
+
+def categorize_statement(session: Session, statement: Statement) -> None:
+    """The pipeline pass: normalize the merchant, predict (rules then LLM), and
+    resolve for every transaction on the statement. Idempotent; leaves a
+    `USER`-set transaction's prediction untouched."""
+    rules = _rule_lookup(session)
+    txns = list(
+        session.exec(
+            select(Transaction).where(col(Transaction.statement_id) == statement.id)
+        )
+    )
+    _predict_and_resolve(session, txns, rules)
     session.commit()
+
+
+def recategorize_pending(session: Session) -> int:
+    """Re-run normalization and prediction (deterministic rules, then LLM) for
+    every transaction not fixed by a user override -- the backfill path for
+    transactions imported before a rule existed, before merchant normalization
+    was fixed, or before an LLM key was ever configured (none of which
+    `recategorize_transaction` covers, since it only re-resolves from the
+    already-stored prediction).
+
+    Never touches a `USER`-set transaction (REQ-CAT-004); an active merchant
+    rule still wins in `resolve_category` regardless of what the fresh
+    prediction says. Idempotent -- re-running with no config/rule change
+    reproduces the same result. Returns the number of transactions considered.
+    """
+    rules = _rule_lookup(session)
+    txns = list(
+        session.exec(
+            select(Transaction).where(col(Transaction.user_category).is_(None))
+        )
+    )
+    _predict_and_resolve(session, txns, rules)
+    session.commit()
+    return len(txns)
 
 
 def recategorize_transaction(session: Session, txn: Transaction) -> None:

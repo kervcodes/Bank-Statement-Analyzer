@@ -80,6 +80,19 @@ MERCHANT_ALIASES: tuple[tuple[str, str], ...] = (
     ("MARRIOTT", "Marriott"),
     ("AIRBNB", "Airbnb"),
     ("IRS ", "IRS"),
+    ("ALDI", "Aldi"),
+    ("BJ'S", "BJ's Wholesale Club"),
+    ("BJS", "BJ's Wholesale Club"),
+    ("WENDY'S", "Wendy's"),
+    ("BURGER KING", "Burger King"),
+    ("7-ELEVEN", "7-Eleven"),
+    ("HOME DEPOT", "Home Depot"),
+    ("NORDSTROM", "Nordstrom"),
+    ("ADVANCE AUTO", "Advance Auto Parts"),
+    ("BURLINGTON", "Burlington"),
+    ("DOLLAR TREE", "Dollar Tree"),
+    ("DOLLAR GENERAL", "Dollar General"),
+    ("TMOBILE", "T-Mobile"),
 )
 
 # --- merchant → category ----------------------------------------------------
@@ -135,6 +148,37 @@ _MERCHANT_CATEGORY_RAW: dict[str, str] = {
     "Zelle": "Transfers",
     "Cash App": "Transfers",
     "PayPal": "Shopping",
+    "Aldi": "Groceries",
+    "BJ's Wholesale Club": "Groceries",
+    "Wendy's": "Dining",
+    "Burger King": "Dining",
+    # No "Convenience" category exists in the taxonomy; a non-fuel 7-Eleven
+    # purchase is closer to Shopping than any other existing category.
+    "7-Eleven": "Shopping",
+    "Home Depot": "Shopping",
+    "Nordstrom": "Shopping",
+    "Advance Auto Parts": "Shopping",
+    "Burlington": "Shopping",
+    "Dollar Tree": "Shopping",
+    "Dollar General": "Shopping",
+}
+
+# --- merchant-specific contextual rules -------------------------------------
+# Some merchants sell across more than one category depending on the specific
+# transaction, not the merchant as a whole (a warehouse club sells both
+# groceries and gas). A flat merchant->category default cannot express this,
+# so this tier is checked first: for a merchant listed here, if one of its
+# patterns is found in the transaction's own `description_normalized` (never
+# the collapsed `merchant_normalized` -- that value is intentionally lossy),
+# its category wins over the merchant's own default below. First match wins
+# per merchant, so order patterns most-specific first.
+MERCHANT_CONTEXTUAL_RULES: dict[str, tuple[tuple[str, str], ...]] = {
+    # Real statement evidence: "BJ's Fuel #..." and a "MOBILE -" channel
+    # prefix (this bank's card-present indicator at the pump) both mean Fuel;
+    # "BJ's Wholesale ..." with neither token means an in-store purchase.
+    "BJ's Wholesale Club": (("FUEL", "Fuel"), ("MOBILE", "Fuel")),
+    "Costco": (("GAS", "Fuel"), ("FUEL", "Fuel")),
+    "7-Eleven": (("FUEL", "Fuel"), ("GAS", "Fuel")),
 }
 
 # --- keyword → category (weaker fallback) ----------------------------------
@@ -159,6 +203,7 @@ KEYWORD_CATEGORY: tuple[tuple[str, str], ...] = (
     ("ONLINE TRANSFER", "Transfers"),
     ("CREDIT CARD PAYMENT", "Credit Card Payments"),
     ("CARD PAYMENT", "Credit Card Payments"),
+    ("CRCARDPMT", "Credit Card Payments"),
     ("AUTOPAY", "Credit Card Payments"),
     ("MORTGAGE", "Housing"),
     ("RENT", "Housing"),
@@ -178,6 +223,9 @@ KEYWORD_CATEGORY: tuple[tuple[str, str], ...] = (
     ("COFFEE", "Dining"),
     ("PARKING", "Transportation"),
     ("TRANSIT", "Transportation"),
+    ("TOLL", "Transportation"),
+    ("EZPASS", "Transportation"),
+    ("E-ZPASS", "Transportation"),
     ("GYM", "Personal Care"),
     ("SALON", "Personal Care"),
     ("HOTEL", "Travel"),
@@ -186,6 +234,10 @@ KEYWORD_CATEGORY: tuple[tuple[str, str], ...] = (
     ("IRS", "Taxes"),
     ("TAX REF", "Income"),
     ("TAX", "Taxes"),
+    # A last-resort, deliberately broad catch-all -- kept last so every more
+    # specific fee phrase above (and every unrelated keyword, e.g. PARKING)
+    # wins first. Mirrors the existing bare "TAX" fallback in the same spirit.
+    ("FEE", "Fees & Interest"),
 )
 
 

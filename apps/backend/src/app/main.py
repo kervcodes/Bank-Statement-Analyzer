@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.accounts import router as accounts_router
 from app.api.analytics import router as analytics_router
 from app.api.batches import router as batches_router
+from app.api.categorization import router as categorization_router
 from app.api.category_rules import router as category_rules_router
 from app.api.review import router as review_router
 from app.api.settings import router as settings_router
@@ -44,6 +45,7 @@ app.include_router(transactions_router)
 app.include_router(category_rules_router)
 app.include_router(accounts_router)
 app.include_router(settings_router)
+app.include_router(categorization_router)
 
 # Single-user local desktop app: the renderer (Vite dev server or a packaged
 # file:// origin) is always cross-origin from this sidecar on 127.0.0.1, and

@@ -10,6 +10,7 @@ from app.services.categorization import (
     AUTO_ASSIGN_THRESHOLD,
     categorize_statement,
     predict_category,
+    recategorize_pending,
     recategorize_transaction,
     resolve_category,
 )
@@ -94,6 +95,85 @@ def test_predict_unknown_debit_is_no_prediction():
     p = predict_category("Zzq Unknown", "ZZQ UNKNOWN LLC", "DEBIT")
     assert p.category is None
     assert p.source == "NONE"
+
+
+# --- merchant-contextual rules (a merchant sells across >1 category) -------
+
+
+def test_contextual_pattern_overrides_merchant_default():
+    p = predict_category("BJ's Wholesale Club", "BJ'S FUEL #9101", "DEBIT")
+    assert p.category == "Fuel"
+    assert p.source == "RULE"
+    assert p.confidence >= AUTO_ASSIGN_THRESHOLD
+
+
+def test_contextual_pattern_matches_the_mobile_channel_signal():
+    # This bank's "MOBILE - " channel prefix is itself the fuel signal for
+    # BJ's specifically -- see MERCHANT_CONTEXTUAL_RULES.
+    p = predict_category("BJ's Wholesale Club", "MOBILE - BJS", "DEBIT")
+    assert p.category == "Fuel"
+
+
+def test_merchant_default_still_applies_with_no_contextual_match():
+    p = predict_category("BJ's Wholesale Club", "BJS WHOLESALE #123", "DEBIT")
+    assert p.category == "Groceries"
+
+
+def test_costco_fuel_overrides_the_groceries_default():
+    p = predict_category("Costco", "COSTCO GAS #445", "DEBIT")
+    assert p.category == "Fuel"
+
+
+def test_costco_default_is_still_groceries():
+    p = predict_category("Costco", "COSTCO WHOLESALE #445", "DEBIT")
+    assert p.category == "Groceries"
+
+
+def test_contextual_pattern_never_fires_for_the_wrong_merchant():
+    # "FUEL" appearing in some unrelated merchant's description must not
+    # trigger a rule scoped to a different merchant.
+    p = predict_category("Some Fuel Depot", "SOME FUEL DEPOT INC", "DEBIT")
+    assert p.category is None
+
+
+# --- newly-added deterministic coverage -------------------------------------
+
+
+def test_predict_new_common_chains():
+    assert predict_category("Aldi", "ALDI 123 CAMBRIDGE", "DEBIT").category == (
+        "Groceries"
+    )
+    assert predict_category("Wendy's", "WENDY'S #2284", "DEBIT").category == "Dining"
+    assert (
+        predict_category("Burger King", "BURGER KING #1", "DEBIT").category == "Dining"
+    )
+    assert predict_category("7-Eleven", "7-ELEVEN #1", "DEBIT").category == "Shopping"
+    assert (
+        predict_category("Home Depot", "HOME DEPOT #1", "DEBIT").category == "Shopping"
+    )
+
+
+def test_predict_toll_and_generic_fee_keywords():
+    assert (
+        predict_category("Mass Pike", "E-ZPASS MA WALTHAM", "DEBIT").category
+        == "Transportation"
+    )
+    assert (
+        predict_category("Capital One", "CAPITAL ONE CRCARDPMT", "DEBIT").category
+        == "Credit Card Payments"
+    )
+    assert (
+        predict_category("Some Bank", "INTERNATIONAL TRANSACTION FEE", "DEBIT").category
+        == "Fees & Interest"
+    )
+
+
+def test_generic_fee_keyword_does_not_shadow_parking():
+    # PARKING is checked before the generic FEE catch-all.
+    assert (
+        predict_category("City Garage", "CITY GARAGE PARKING FEE", "DEBIT").category
+        == "Transportation"
+    )
 
 
 # --- resolve_category (the hierarchy) --------------------------------------
@@ -269,3 +349,98 @@ def test_deleting_a_merchant_rule_restores_the_prediction(session: Session):
     session.refresh(t)
     assert t.category == "Shopping"
     assert t.category_source == "RULE"
+
+
+# --- recategorize_pending (the backfill path) -------------------------------
+
+
+def test_recategorize_pending_reprocesses_a_transaction_left_none(session: Session):
+    # Simulates a transaction imported before "Aldi" existed as a rule: it was
+    # committed with the pipeline's own defaults and never touched again.
+    s = _statement(session)
+    t = _txn(session, s, desc="ALDI 123 CAMBRIDGE")
+    assert t.merchant_normalized is None
+    assert t.category == "Uncategorized"
+
+    considered = recategorize_pending(session)
+
+    session.refresh(t)
+    assert considered == 1
+    assert t.merchant_normalized == "Aldi"
+    assert t.category == "Groceries"
+    assert t.category_source == "RULE"
+
+
+def test_recategorize_pending_never_touches_a_user_override(session: Session):
+    s = _statement(session)
+    t = _txn(session, s, desc="ALDI 123 CAMBRIDGE")
+    t.user_category = "Personal Care"
+    recategorize_transaction(session, t)  # the real path: resolves immediately
+    session.commit()
+
+    recategorize_pending(session)
+
+    session.refresh(t)
+    assert t.category == "Personal Care"
+    assert t.category_source == "USER"
+    # a user-set row's prediction is still never populated
+    assert t.predicted_category is None
+
+
+def test_recategorize_pending_honors_an_active_merchant_rule(session: Session):
+    s = _statement(session)
+    t = _txn(session, s, desc="ALDI 123 CAMBRIDGE")
+    session.add(CategoryRule(merchant="Aldi", category="Personal Care"))
+    session.commit()
+
+    recategorize_pending(session)
+
+    session.refresh(t)
+    assert t.category == "Personal Care"
+    assert t.category_source == "MERCHANT_RULE"
+    # the fresh deterministic guess is still recorded underneath
+    assert t.predicted_category == "Groceries"
+
+
+def test_recategorize_pending_picks_up_a_new_contextual_rule(session: Session):
+    # A Costco gas purchase that was mis-categorized as Groceries under the
+    # old flat-default behavior gets corrected by a re-run.
+    s = _statement(session)
+    t = _txn(session, s, desc="COSTCO GAS #445")
+    t.merchant_normalized = "Costco"
+    t.predicted_category = "Groceries"
+    t.predicted_confidence = 0.97
+    t.predicted_source = "RULE"
+    t.category = "Groceries"
+    t.category_source = "RULE"
+    session.add(t)
+    session.commit()
+
+    recategorize_pending(session)
+
+    session.refresh(t)
+    assert t.category == "Fuel"
+
+
+def test_recategorize_pending_is_idempotent(session: Session):
+    s = _statement(session)
+    _txn(session, s, desc="ALDI 123 CAMBRIDGE")
+    recategorize_pending(session)
+    considered_again = recategorize_pending(session)
+    (t,) = session.exec(
+        select(Transaction).where(col(Transaction.statement_id) == s.id)
+    )
+    assert considered_again == 1
+    assert t.category == "Groceries"
+
+
+def test_recategorize_pending_is_a_no_op_with_nothing_eligible(session: Session):
+    s = _statement(session)
+    t = _txn(session, s, desc="ALDI 123 CAMBRIDGE")
+    t.user_category = "Groceries"
+    session.add(t)
+    session.commit()
+
+    considered = recategorize_pending(session)
+
+    assert considered == 0
